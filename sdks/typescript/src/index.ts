@@ -29,6 +29,15 @@
 // Main client
 export { HeliosDB, HeliosDBConfig } from './client/heliosdb';
 
+// Supabase-compatible query builder
+export { QueryBuilder } from './client/query-builder';
+
+// Auth
+export { AuthClient, AuthResponse } from './auth/index';
+
+// Realtime
+export { RealtimeChannel, RealtimeEvent, RealtimePayload } from './realtime/index';
+
 // Vector operations
 export { VectorStore, VectorStoreConfig } from './vector/store';
 

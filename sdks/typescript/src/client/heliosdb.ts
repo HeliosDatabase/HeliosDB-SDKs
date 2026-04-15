@@ -20,6 +20,9 @@ import { createErrorFromResponse, ValidationError } from '../errors';
 import { VectorStore, VectorStoreConfig } from '../vector/store';
 import { AgentMemory } from '../memory/agent-memory';
 import { BranchContext, TableQuery } from './branch';
+import { QueryBuilder } from './query-builder';
+import { AuthClient } from '../auth/index';
+import { RealtimeChannel } from '../realtime/index';
 
 /**
  * Configuration for HeliosDB client
@@ -563,6 +566,89 @@ export class HeliosDB {
     });
 
     return new QueryResultImpl<T>(data);
+  }
+
+  // ==========================================================================
+  // Supabase-Compatible API
+  // ==========================================================================
+
+  /**
+   * Start a Supabase-style fluent query on a table
+   *
+   * @param table - Table name to query
+   * @returns A chainable QueryBuilder instance
+   *
+   * @example
+   * ```typescript
+   * // Fluent query (Supabase-compatible)
+   * const { data, error } = await db.from('users')
+   *   .select('id, name, email')
+   *   .eq('active', true)
+   *   .order('created_at', { ascending: false })
+   *   .limit(10);
+   *
+   * // Single row
+   * const { data: user } = await db.from('users')
+   *   .select('*')
+   *   .eq('id', 42)
+   *   .single();
+   * ```
+   */
+  from(table: string): QueryBuilder {
+    return new QueryBuilder(
+      table,
+      this.config.url,
+      this.config.apiKey ?? ''
+    );
+  }
+
+  /**
+   * Get the authentication client
+   *
+   * @example
+   * ```typescript
+   * // Sign up
+   * const result = await db.auth.signUp({ email: 'user@example.com', password: 'secret' });
+   *
+   * // Sign in
+   * const session = await db.auth.signIn({ email: 'user@example.com', password: 'secret' });
+   *
+   * // Get current user
+   * const user = await db.auth.getUser(session.access_token);
+   *
+   * // Sign out
+   * await db.auth.signOut();
+   * ```
+   */
+  get auth(): AuthClient {
+    return new AuthClient(this.config.url, this.config.apiKey ?? '');
+  }
+
+  /**
+   * Create a realtime channel for change notifications
+   *
+   * @param topic - Table name or channel topic to subscribe to
+   * @returns A RealtimeChannel that can be configured and subscribed
+   *
+   * @example
+   * ```typescript
+   * const channel = db.channel('users');
+   *
+   * channel
+   *   .on('INSERT', (payload) => console.log('New row:', payload))
+   *   .on('UPDATE', (payload) => console.log('Updated:', payload))
+   *   .on('*', (payload) => console.log('Any change:', payload))
+   *   .subscribe();
+   *
+   * // Later, disconnect
+   * channel.unsubscribe();
+   * ```
+   */
+  channel(topic: string): RealtimeChannel {
+    const wsUrl = this.config.url
+      .replace(/^http:/, 'ws:')
+      .replace(/^https:/, 'wss:');
+    return new RealtimeChannel(`${wsUrl}/realtime/v1/websocket`, topic);
   }
 
   // Internal request method for use by other classes
