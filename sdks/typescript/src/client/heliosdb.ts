@@ -518,6 +518,49 @@ export class HeliosDB {
     return new VectorStore(this, name, config);
   }
 
+  /**
+   * Retrieve relevant documents for a RAG query.
+   * Combines vector search with optional SQL filtering.
+   *
+   * @param query - The query text (will be embedded server-side)
+   * @param collection - Name of the vector store collection
+   * @param opts - Optional parameters
+   * @param opts.k - Number of results to return (default 5)
+   * @param opts.filter - Metadata filter for narrowing results
+   * @returns Array of matching documents with content, score, and metadata
+   *
+   * @example
+   * ```typescript
+   * const results = await db.rag("What is HeliosDB?", "docs", { k: 3 });
+   * for (const r of results) {
+   *   console.log(`[${r.score.toFixed(2)}] ${r.content}`);
+   * }
+   * ```
+   */
+  async rag(
+    query: string,
+    collection: string,
+    opts?: { k?: number; filter?: Record<string, any> }
+  ): Promise<{ content: string; score: number; metadata: Record<string, any> }[]> {
+    const store = this.vectorStore(collection);
+    const results = await store.search(
+      // Pass the query string as a vector placeholder -- the server
+      // performs embedding when it receives a string via the REST API.
+      query as any,
+      {
+        topK: opts?.k ?? 5,
+        filter: opts?.filter,
+        includeMetadata: true,
+      }
+    );
+
+    return results.map((r) => ({
+      content: (r.metadata?.text as string) ?? '',
+      score: r.score,
+      metadata: r.metadata ?? {},
+    }));
+  }
+
   // ==========================================================================
   // Agent Memory
   // ==========================================================================

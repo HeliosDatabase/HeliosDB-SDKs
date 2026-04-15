@@ -1,7 +1,11 @@
 """
 LlamaIndex integration for HeliosDB.
 
-Provides LlamaIndex-compatible VectorStore implementation.
+Provides a LlamaIndex-compatible ``VectorStore`` implementation that stores
+and retrieves embeddings using HeliosDB's HNSW-accelerated vector search.
+
+Classes:
+    HeliosDBLlamaVectorStore: Drop-in VectorStore for LlamaIndex pipelines.
 """
 
 from __future__ import annotations
@@ -39,10 +43,24 @@ def _check_llamaindex() -> None:
 
 
 class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):  # type: ignore
-    """
-    LlamaIndex VectorStore implementation for HeliosDB.
+    """LlamaIndex ``VectorStore`` backed by HeliosDB.
 
-    Example:
+    Implements the full LlamaIndex vector store contract including
+    ``add()``, ``delete()``, and ``query()`` with metadata filtering,
+    so it works seamlessly with ``VectorStoreIndex`` and any query engine
+    or retriever built on top of it.
+
+    Args:
+        connection_string: HeliosDB server URL (``http://...``) or local
+            file path for embedded mode.
+        collection_name: Name of the vector collection to use or create.
+        api_key: Optional API key for authenticated connections.
+        dimension: Dimensionality of the embedding vectors (default 1536).
+        metric: Distance metric -- ``"cosine"``, ``"euclidean"``, or
+            ``"dot_product"`` (default ``"cosine"``).
+
+    Example::
+
         from llama_index.core import VectorStoreIndex
         from heliosdb.integrations.llamaindex import HeliosDBLlamaVectorStore
 
@@ -51,9 +69,11 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
             collection_name="documents",
         )
 
+        # Build an index from the store
         index = VectorStoreIndex.from_vector_store(vector_store)
         query_engine = index.as_query_engine()
         response = query_engine.query("What is HeliosDB?")
+        print(response)
     """
 
     stores_text: bool = True
@@ -67,15 +87,14 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
         dimension: int = 1536,
         metric: str = "cosine",
     ) -> None:
-        """
-        Initialize HeliosDB LlamaIndex VectorStore.
+        """Initialize HeliosDB LlamaIndex VectorStore.
 
         Args:
-            connection_string: HeliosDB server URL or file path
-            collection_name: Name of the vector collection
-            api_key: API key for authentication
-            dimension: Vector dimension
-            metric: Distance metric (cosine, euclidean, dot_product)
+            connection_string: HeliosDB server URL or file path.
+            collection_name: Name of the vector collection.
+            api_key: API key for authentication.
+            dimension: Vector dimension (must match embedding model output).
+            metric: Distance metric (``cosine``, ``euclidean``, ``dot_product``).
         """
         _check_llamaindex()
 
@@ -91,12 +110,12 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
 
     @classmethod
     def class_name(cls) -> str:
-        """Return class name for serialization."""
+        """Return the canonical class name used by LlamaIndex serialization."""
         return "HeliosDBVectorStore"
 
     @property
     def client(self) -> Any:
-        """Return the HeliosDB client."""
+        """Return the underlying :class:`~heliosdb.client.HeliosDB` client."""
         return self._client
 
     def add(
@@ -104,14 +123,30 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
         nodes: List[BaseNode],
         **kwargs: Any,
     ) -> List[str]:
-        """
-        Add nodes to the vector store.
+        """Add LlamaIndex nodes (with pre-computed embeddings) to the store.
+
+        Each node's embedding, text content, metadata, and relationships are
+        persisted.  Nodes **must** have embeddings attached (e.g. via an
+        ``embed_model``); a ``ValueError`` is raised otherwise.
 
         Args:
-            nodes: List of LlamaIndex nodes to add
+            nodes: List of LlamaIndex ``BaseNode`` instances to store.
+            **kwargs: Reserved for future use.
 
         Returns:
-            List of node IDs
+            List[str]: Ordered list of node IDs that were stored.
+
+        Raises:
+            ValueError: If any node is missing an embedding.
+
+        Example::
+
+            from llama_index.core.schema import TextNode
+
+            nodes = [
+                TextNode(text="HeliosDB overview", embedding=[0.1, 0.2, ...]),
+            ]
+            ids = vector_store.add(nodes)
         """
         vectors = []
         ids = []
@@ -145,11 +180,16 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
         return ids
 
     def delete(self, ref_doc_id: str, **kwargs: Any) -> None:
-        """
-        Delete nodes by reference document ID.
+        """Delete nodes associated with a reference document ID.
 
         Args:
-            ref_doc_id: Reference document ID to delete
+            ref_doc_id: The reference document ID whose nodes should be
+                removed from the store.
+            **kwargs: Reserved for future use.
+
+        Note:
+            Deletion is best-effort.  If the ID does not exist, the call
+            completes silently without raising an error.
         """
         # Query for nodes with this ref_doc_id
         # In a full implementation, we would query by metadata
@@ -164,14 +204,31 @@ class HeliosDBLlamaVectorStore(VectorStore if LLAMAINDEX_AVAILABLE else object):
         query: VectorStoreQuery,
         **kwargs: Any,
     ) -> VectorStoreQueryResult:
-        """
-        Query the vector store.
+        """Execute a similarity search and return ranked results.
+
+        Performs HNSW approximate nearest-neighbour search using the query
+        embedding and optional metadata filters.
 
         Args:
-            query: LlamaIndex VectorStoreQuery
+            query: A LlamaIndex ``VectorStoreQuery`` containing the query
+                embedding, ``similarity_top_k``, and optional ``filters``.
+            **kwargs: Reserved for future use.
 
         Returns:
-            VectorStoreQueryResult with matching nodes
+            VectorStoreQueryResult: Contains parallel lists of ``nodes``,
+                ``similarities`` (float scores), and ``ids`` (str).
+
+        Raises:
+            ValueError: If ``query.query_embedding`` is *None*.
+
+        Example::
+
+            from llama_index.core.vector_stores.types import VectorStoreQuery
+
+            vsq = VectorStoreQuery(query_embedding=[0.1, ...], similarity_top_k=5)
+            result = vector_store.query(vsq)
+            for node, score in zip(result.nodes, result.similarities):
+                print(f"{score:.3f}  {node.get_content()[:80]}")
         """
         _check_llamaindex()
 

@@ -44,6 +44,9 @@ export { VectorStore, VectorStoreConfig } from './vector/store';
 // Agent memory
 export { AgentMemory } from './memory/agent-memory';
 
+// LangChain-compatible conversation memory
+export { HeliosDBMemory } from './memory/index';
+
 // Types
 export type {
   QueryResult,
