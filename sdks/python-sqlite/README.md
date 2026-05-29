@@ -2,7 +2,7 @@
 
 [![PyPI Version](https://img.shields.io/pypi/v/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
-[![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/Dimensigon/heliosdb-sdks/blob/main/LICENSE)
+[![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/LICENSE)
 [![Downloads](https://img.shields.io/pypi/dm/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
 
 **SQLite-compatible interface for HeliosDB** - A drop-in replacement for Python's `sqlite3` module with enhanced features including vector search, encryption, and time-travel queries.
@@ -308,8 +308,8 @@ finally:
 
 - **Full Documentation**: https://docs.heliosdb.io/sqlite-compat
 - **API Reference**: https://docs.heliosdb.io/sqlite-compat/api
-- **Examples**: https://github.com/Dimensigon/heliosdb-sdks/tree/main/examples
-- **HeliosDB Docs**: https://github.com/Dimensigon/heliosdb-sdks
+- **Examples**: https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/examples
+- **HeliosDB Docs**: https://github.com/HeliosDatabase/HeliosDB-SDKs
 
 ---
 
@@ -348,12 +348,12 @@ pip install heliosdb-sqlite --no-binary heliosdb-sqlite
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/Dimensigon/heliosdb-sdks/blob/main/CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/CONTRIBUTING.md) for guidelines.
 
 ### Development Setup
 
 ```bash
-git clone https://github.com/Dimensigon/heliosdb-sdks.git
+git clone https://github.com/HeliosDatabase/HeliosDB-SDKs.git
 cd heliosdb-sdks/sdks/python-sqlite
 
 # Install in development mode
@@ -374,14 +374,14 @@ mypy heliosdb_sqlite/
 
 ## License
 
-Apache License 2.0 - see [LICENSE](https://github.com/Dimensigon/heliosdb-sdks/blob/main/LICENSE) for details.
+Apache License 2.0 - see [LICENSE](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/LICENSE) for details.
 
 ---
 
 ## Support
 
-- **GitHub Issues**: https://github.com/Dimensigon/heliosdb-sdks/issues
-- **Discussions**: https://github.com/Dimensigon/heliosdb-sdks/discussions
+- **GitHub Issues**: https://github.com/HeliosDatabase/HeliosDB-SDKs/issues
+- **Discussions**: https://github.com/HeliosDatabase/HeliosDB-SDKs/discussions
 - **Discord**: https://discord.gg/heliosdb
 - **Email**: support@heliosdb.io
 
@@ -399,4 +399,4 @@ Built on top of:
 
 **Made with ❤️ for developers who need production-grade embedded databases**
 
-[⭐ Star us on GitHub](https://github.com/Dimensigon/heliosdb-sdks)
+[⭐ Star us on GitHub](https://github.com/HeliosDatabase/HeliosDB-SDKs)
