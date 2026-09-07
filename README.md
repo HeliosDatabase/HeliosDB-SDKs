@@ -35,4 +35,4 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).

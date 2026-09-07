@@ -7,7 +7,7 @@
   },
   "keywords": ["database", "postgresql", "mysql", "sqlite", "embedded", "vector-search", "supabase-alternative"],
   "author": "Daniel Moya <daniel.moya@dimensigon.com>",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/dimensigon/heliosdb-sdks"

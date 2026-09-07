@@ -237,7 +237,7 @@ if __name__ == "__main__":
             "Discord": "https://discord.gg/heliosdb",
         },
         # License
-        license="AGPL-3.0-only",
+        license="Apache-2.0",
         license_files=["LICENSE"],
         # Python version support
         python_requires=">=3.8",
@@ -304,7 +304,7 @@ if __name__ == "__main__":
             "Intended Audience :: Science/Research",
             "Intended Audience :: Information Technology",
             # License
-            "License :: OSI Approved :: GNU Affero General Public License v3",
+            "License :: OSI Approved :: Apache Software License",
             # Operating Systems
             "Operating System :: OS Independent",
             "Operating System :: POSIX :: Linux",

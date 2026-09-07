@@ -2,7 +2,7 @@
   "name": "n8n-nodes-heliosdb",
   "version": "3.0.0",
   "description": "n8n nodes for HeliosDB - AI-native embedded database",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/Dimensigon/heliosdb-sdks",
   "repository": {
     "type": "git",
