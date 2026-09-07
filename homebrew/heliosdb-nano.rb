@@ -2,7 +2,7 @@ class HeliosdbNano < Formula
   desc "PostgreSQL & MySQL compatible embedded database with vector search"
   homepage "https://github.com/Dimensigon/HDB-HeliosDB-Nano"
   version "3.10.0"
-  license "AGPL-3.0-only"
+  license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
