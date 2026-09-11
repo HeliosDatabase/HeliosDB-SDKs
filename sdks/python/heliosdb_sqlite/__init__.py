@@ -17,7 +17,7 @@ Usage:
     cursor.execute("SELECT * FROM users")
 """
 
-__version__ = "3.0.1"
+__version__ = "3.0.2"
 __author__ = "HeliosDB Team"
 
 from .main import (
@@ -50,6 +50,12 @@ from .main import (
     SQLITE_ERROR,
     SQLITE_DENY,
     SQLITE_IGNORE,
+    LEGACY_TRANSACTION_CONTROL,
+
+    # DB-API 2.0 module globals
+    apilevel,
+    threadsafety,
+    paramstyle,
 
     # Type converters
     Binary,
@@ -95,6 +101,10 @@ __all__ = [
     'SQLITE_ERROR',
     'SQLITE_DENY',
     'SQLITE_IGNORE',
+    'LEGACY_TRANSACTION_CONTROL',
+    'apilevel',
+    'threadsafety',
+    'paramstyle',
     'Binary',
     'Date',
     'Time',
