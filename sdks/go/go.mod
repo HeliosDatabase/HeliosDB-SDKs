@@ -1,7 +1,3 @@
-module github.com/heliosdb/heliosdb-go
+module github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go
 
 go 1.21
-
-require (
-	golang.org/x/sync v0.5.0
-)

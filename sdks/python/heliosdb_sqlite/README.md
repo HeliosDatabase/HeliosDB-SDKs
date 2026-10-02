@@ -520,12 +520,12 @@ python -m pytest tests/integration/
 
 ## License
 
-MIT License - see main HeliosDB repository
+Apache-2.0 — see [LICENSE](../../../LICENSE) in the HeliosDB-SDKs repository.
 
 ## Support
 
 - **Documentation:** See docs/ directory
-- **Issues:** GitHub Issues
+- **Issues:** https://github.com/HeliosDatabase/HeliosDB-SDKs/issues
 - **Examples:** HELIOSDB_SQLITE_USAGE_EXAMPLES.py
 - **API Reference:** HELIOSDB_SQLITE_API_REFERENCE.md
 

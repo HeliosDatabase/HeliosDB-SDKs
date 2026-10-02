@@ -226,15 +226,14 @@ if __name__ == "__main__":
         maintainer="HeliosDB Team",
         maintainer_email="support@heliosdb.com",
         # URLs
-        url="https://github.com/Dimensigon/heliosdb-sdks",
+        url="https://github.com/HeliosDatabase/HeliosDB-SDKs",
         project_urls={
-            "Homepage": "https://github.com/Dimensigon/heliosdb-sdks",
-            "Documentation": "https://docs.heliosdb.io/sqlite-compat",
-            "Repository": "https://github.com/Dimensigon/heliosdb-sdks",
-            "Source Code": "https://github.com/Dimensigon/heliosdb-sdks/tree/main/sdks/python-sqlite",
-            "Issues": "https://github.com/Dimensigon/heliosdb-sdks/issues",
-            "Changelog": "https://github.com/Dimensigon/heliosdb-sdks/blob/main/CHANGELOG.md",
-            "Discord": "https://discord.gg/heliosdb",
+            "Homepage": "https://heliosdb.com",
+            "Documentation": "https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_drop_in_guide/",
+            "Repository": "https://github.com/HeliosDatabase/HeliosDB-SDKs",
+            "Source Code": "https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/sdks/python-sqlite",
+            "Issues": "https://github.com/HeliosDatabase/HeliosDB-SDKs/issues",
+            "Discord": "https://discord.gg/yTykuUrFXc",
         },
         # License
         license="Apache-2.0",

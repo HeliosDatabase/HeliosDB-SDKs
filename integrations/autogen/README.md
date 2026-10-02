@@ -4,11 +4,14 @@ Integration package for using HeliosDB with Microsoft AutoGen multi-agent framew
 
 ## Installation
 
+`heliosdb-autogen` is not yet published on PyPI; install it from the
+[HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository:
+
 ```bash
-pip install heliosdb-autogen
+pip install "heliosdb-autogen @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=integrations/autogen"
 ```
 
-Or install from source:
+Or, from a local checkout:
 
 ```bash
 cd integrations/autogen

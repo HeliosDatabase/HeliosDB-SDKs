@@ -8,7 +8,8 @@
   "icon": "images/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Dimensigon/heliosdb-sdks"
+    "url": "git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git",
+    "directory": "integrations/vscode"
   },
   "engines": {
     "vscode": "^1.85.0"

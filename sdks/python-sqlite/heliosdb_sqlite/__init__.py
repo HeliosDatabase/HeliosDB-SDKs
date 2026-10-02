@@ -25,7 +25,7 @@ Example:
     [(1, 'Alice')]
     >>> conn.close()
 
-For full documentation, see: https://docs.heliosdb.io/sqlite-compat
+For full documentation, see: https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_drop_in_guide/
 """
 
 from ._version import __version__

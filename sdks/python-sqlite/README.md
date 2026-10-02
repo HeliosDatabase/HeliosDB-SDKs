@@ -1,9 +1,6 @@
 # heliosdb-sqlite
 
-[![PyPI Version](https://img.shields.io/pypi/v/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
-[![Python Versions](https://img.shields.io/pypi/pyversions/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
-[![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/LICENSE)
-[![Downloads](https://img.shields.io/pypi/dm/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/LICENSE)
 
 **SQLite-compatible interface for HeliosDB** - A drop-in replacement for Python's `sqlite3` module with enhanced features including vector search, encryption, and time-travel queries.
 
@@ -24,23 +21,26 @@
 
 ## Installation
 
+`heliosdb-sqlite` is not yet published on PyPI; install it from the
+[HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository.
+
 ### Standard Installation
 
 ```bash
-pip install heliosdb-sqlite
+pip install "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 ```
 
 ### With Optional Dependencies
 
 ```bash
 # Vector operations (numpy, scipy)
-pip install heliosdb-sqlite[vector]
+pip install "heliosdb-sqlite[vector] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 
 # Pandas integration
-pip install heliosdb-sqlite[pandas]
+pip install "heliosdb-sqlite[pandas] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 
 # All features
-pip install heliosdb-sqlite[all]
+pip install "heliosdb-sqlite[all] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 ```
 
 ### Verify Installation
@@ -306,10 +306,10 @@ finally:
 
 ## Documentation
 
-- **Full Documentation**: https://docs.heliosdb.io/sqlite-compat
-- **API Reference**: https://docs.heliosdb.io/sqlite-compat/api
-- **Examples**: https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/examples
-- **HeliosDB Docs**: https://github.com/HeliosDatabase/HeliosDB-SDKs
+- **Drop-in guide**: https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_drop_in_guide/
+- **Migration patterns**: https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_migration_patterns/
+- **Troubleshooting**: https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_troubleshooting/
+- **HeliosDB Nano docs**: https://heliosdb.com/docs/nano/
 
 ---
 
@@ -319,7 +319,7 @@ finally:
 
 ```bash
 # Reinstall package
-pip install --force-reinstall --no-cache-dir heliosdb-sqlite
+pip install --force-reinstall --no-cache-dir "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 
 # Check binary location
 python -c "import heliosdb_sqlite; print(heliosdb_sqlite.get_binary_path())"
@@ -341,20 +341,20 @@ If your platform doesn't have pre-built wheels, you can build from source:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Build from source
-pip install heliosdb-sqlite --no-binary heliosdb-sqlite
+pip install --no-binary heliosdb-sqlite "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 ```
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/HeliosDatabase/HeliosDB-SDKs/blob/main/CONTRIBUTING.md) for guidelines.
+Contributions are welcome — open an issue or a pull request on [GitHub](https://github.com/HeliosDatabase/HeliosDB-SDKs).
 
 ### Development Setup
 
 ```bash
 git clone https://github.com/HeliosDatabase/HeliosDB-SDKs.git
-cd heliosdb-sdks/sdks/python-sqlite
+cd HeliosDB-SDKs/sdks/python-sqlite
 
 # Install in development mode
 pip install -e ".[dev]"
@@ -381,9 +381,8 @@ Apache License 2.0 - see [LICENSE](https://github.com/HeliosDatabase/HeliosDB-SD
 ## Support
 
 - **GitHub Issues**: https://github.com/HeliosDatabase/HeliosDB-SDKs/issues
-- **Discussions**: https://github.com/HeliosDatabase/HeliosDB-SDKs/discussions
-- **Discord**: https://discord.gg/heliosdb
-- **Email**: support@heliosdb.io
+- **Discord**: https://discord.gg/yTykuUrFXc
+- **Email**: support@heliosdb.com
 
 ---
 

@@ -6,11 +6,12 @@
     "heliosdb": "./index.js"
   },
   "keywords": ["database", "postgresql", "mysql", "sqlite", "embedded", "vector-search", "supabase-alternative"],
-  "author": "Daniel Moya <daniel.moya@dimensigon.com>",
+  "author": "HeliosDB Team <support@heliosdb.com>",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dimensigon/heliosdb-sdks"
+    "url": "git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git",
+    "directory": "cli"
   },
   "engines": {
     "node": ">=18"

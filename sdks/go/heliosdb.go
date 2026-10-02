@@ -1,4 +1,8 @@
-// Package heliosdb provides a Go client for HeliosDB.
+// Package heliosdb provides a Go client for the HeliosDB REST API.
+//
+// Install:
+//
+//	go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go@latest
 //
 // Example usage:
 //
@@ -93,9 +97,9 @@ func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
 
 // QueryResult represents the result of a SQL query.
 type QueryResult struct {
-	Rows        []map[string]interface{} `json:"rows"`
-	Columns     []string                 `json:"columns"`
-	RowsAffected int64                   `json:"rows_affected,omitempty"`
+	Rows         []map[string]interface{} `json:"rows"`
+	Columns      []string                 `json:"columns"`
+	RowsAffected int64                    `json:"rows_affected,omitempty"`
 }
 
 // Query executes a SQL query.
@@ -185,8 +189,8 @@ func (c *Client) VectorSearch(ctx context.Context, store, query string, opts ...
 	}
 
 	body := map[string]interface{}{
-		"text":   query,
-		"top_k":  options.TopK,
+		"text":  query,
+		"top_k": options.TopK,
 	}
 	if options.MinScore > 0 {
 		body["min_score"] = options.MinScore
@@ -411,9 +415,9 @@ func (c *Client) NLQuery(ctx context.Context, question string) (*QueryResult, st
 	}
 
 	var response struct {
-		SQL    string                   `json:"sql"`
-		Rows   []map[string]interface{} `json:"rows"`
-		Columns []string                `json:"columns"`
+		SQL     string                   `json:"sql"`
+		Rows    []map[string]interface{} `json:"rows"`
+		Columns []string                 `json:"columns"`
 	}
 
 	err := c.post(ctx, "/v1/nl/query", body, &response)

@@ -2,10 +2,11 @@
 name = "heliosdb-client"
 version = "3.0.0"
 edition = "2021"
-authors = ["HeliosDB Team"]
+authors = ["HeliosDB Team <support@heliosdb.com>"]
 license = "Apache-2.0"
 description = "Rust client for HeliosDB - AI-native embedded database"
-repository = "https://github.com/Dimensigon/heliosdb-sdks"
+repository = "https://github.com/HeliosDatabase/HeliosDB-SDKs"
+homepage = "https://heliosdb.com"
 documentation = "https://docs.rs/heliosdb-client"
 readme = "README.md"
 keywords = ["database", "vector-database", "sql", "embedded", "ai"]

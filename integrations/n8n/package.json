@@ -3,10 +3,11 @@
   "version": "3.0.0",
   "description": "n8n nodes for HeliosDB - AI-native embedded database",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/Dimensigon/heliosdb-sdks",
+  "homepage": "https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/integrations/n8n",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Dimensigon/heliosdb-sdks"
+    "url": "git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git",
+    "directory": "integrations/n8n"
   },
   "main": "dist/index.js",
   "scripts": {

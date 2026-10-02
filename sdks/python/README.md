@@ -4,27 +4,30 @@ Official Python SDK for HeliosDB - an AI-native embedded database with PostgreSQ
 
 ## Installation
 
+The SDK is not yet published on PyPI; install it from the
+[HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository:
+
 ```bash
-pip install heliosdb
+pip install "heliosdb @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 ```
 
 ### Optional Dependencies
 
 ```bash
 # For pandas DataFrame support
-pip install heliosdb[pandas]
+pip install "heliosdb[pandas] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 
 # For LangChain integration
-pip install heliosdb[langchain]
+pip install "heliosdb[langchain] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 
 # For LlamaIndex integration
-pip install heliosdb[llamaindex]
+pip install "heliosdb[llamaindex] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 
 # For local embeddings (sentence-transformers)
-pip install heliosdb[embeddings]
+pip install "heliosdb[embeddings] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 
 # Install all optional dependencies
-pip install heliosdb[all]
+pip install "heliosdb[all] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
 ```
 
 ## Quick Start
@@ -326,4 +329,4 @@ except HeliosDBError as e:
 
 ## License
 
-Apache 2.0
+Apache-2.0 — see [LICENSE](../../LICENSE).

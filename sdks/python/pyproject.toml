@@ -67,10 +67,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Dimensigon/heliosdb-sdks"
-Documentation = "https://docs.heliosdb.io/python"
-Repository = "https://github.com/Dimensigon/heliosdb-sdks"
-Issues = "https://github.com/Dimensigon/heliosdb-sdks/issues"
+Homepage = "https://heliosdb.com"
+Documentation = "https://heliosdb.com/docs/nano/api/python-sdk/"
+Repository = "https://github.com/HeliosDatabase/HeliosDB-SDKs"
+Source = "https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/sdks/python"
+Issues = "https://github.com/HeliosDatabase/HeliosDB-SDKs/issues"
 
 [tool.hatch.build.targets.sdist]
 include = [

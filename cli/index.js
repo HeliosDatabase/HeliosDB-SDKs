@@ -7,8 +7,11 @@ const os = require('os');
 const https = require('https');
 
 const VERSION = '3.10.0';
+// HeliosDB Nano release the wrapper downloads (assets are named
+// heliosdb-nano-v<version>-<target>.tar.gz on the GitHub release).
+const NANO_VERSION = '4.41.0';
 const BINARY_NAME = 'heliosdb-nano';
-const GITHUB_REPO = 'Dimensigon/HDB-HeliosDB-Nano';
+const GITHUB_REPO = 'HeliosDatabase/HeliosDB-Nano';
 const INSTALL_DIR = path.join(os.homedir(), '.heliosdb', 'bin');
 
 // Platform detection
@@ -16,7 +19,6 @@ function getPlatformTarget() {
   const platform = process.platform;
   const arch = process.arch;
   if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin';
-  if (platform === 'darwin' && arch === 'x64') return 'x86_64-apple-darwin';
   if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-gnu';
   if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu';
   console.error(`Unsupported platform: ${platform}-${arch}`);
@@ -34,7 +36,7 @@ function isBinaryInstalled() {
 
 async function downloadBinary() {
   const target = getPlatformTarget();
-  const url = `https://github.com/${GITHUB_REPO}/releases/latest/download/${BINARY_NAME}-${target}.tar.gz`;
+  const url = `https://github.com/${GITHUB_REPO}/releases/download/v${NANO_VERSION}/${BINARY_NAME}-v${NANO_VERSION}-${target}.tar.gz`;
 
   console.log(`Downloading HeliosDB Nano for ${target}...`);
   console.log(`From: ${url}`);
@@ -103,7 +105,7 @@ const commands = {
       '--mysql-listen', `127.0.0.1:${config.mysql_port || 3306}`,
     ];
 
-    console.log(`Starting HeliosDB Nano v${VERSION}...`);
+    console.log(`Starting HeliosDB Nano v${NANO_VERSION}...`);
     const child = spawn(getBinaryPath(), args, { stdio: 'inherit' });
     child.on('exit', (code) => process.exit(code || 0));
   },
@@ -141,7 +143,8 @@ Getting started:
   npx heliosdb init
   npx heliosdb start
 
-Docs: https://github.com/${GITHUB_REPO}
+Docs: https://heliosdb.com/docs/nano/
+Source: https://github.com/${GITHUB_REPO}
 `);
   }
 };

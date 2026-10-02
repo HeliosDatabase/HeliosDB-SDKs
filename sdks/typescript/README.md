@@ -4,12 +4,13 @@ Official TypeScript/JavaScript SDK for HeliosDB - an AI-native embedded database
 
 ## Installation
 
+`@heliosdb/client` is not yet published on npm; build it from the
+[HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository and install the local package:
+
 ```bash
-npm install @heliosdb/client
-# or
-yarn add @heliosdb/client
-# or
-pnpm add @heliosdb/client
+git clone https://github.com/HeliosDatabase/HeliosDB-SDKs.git
+(cd HeliosDB-SDKs/sdks/typescript && npm install && npm run build)
+npm install ./HeliosDB-SDKs/sdks/typescript
 ```
 
 ## Quick Start
@@ -291,4 +292,4 @@ This SDK is written in TypeScript and provides full type definitions:
 
 ## License
 
-Apache 2.0
+Apache-2.0 — see [LICENSE](../../LICENSE).

@@ -1,6 +1,6 @@
 # HeliosDB SDKs & Integrations
 
-Official client SDKs and third-party integrations for [HeliosDB](https://github.com/Dimensigon) — shared across all editions (Nano, Lite, Full).
+Official client SDKs and third-party integrations for [HeliosDB](https://heliosdb.com) — shared across all editions (Nano, Lite, Full).
 
 All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), which is identical across editions.
 
@@ -8,7 +8,7 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 
 | Language | Path | Features |
 |----------|------|----------|
-| **Go** | [`sdks/go/`](sdks/go/) | Branches, vector search, agent memory, time-travel |
+| **Go** | [`sdks/go/`](sdks/go/) | Branches, vector search, agent memory, time-travel — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go@latest` |
 | **Python** | [`sdks/python/`](sdks/python/) | Full-featured: vectors, agents, branches, LangChain + LlamaIndex integrations |
 | **Python (SQLite compat)** | [`sdks/python-sqlite/`](sdks/python-sqlite/) | DB-API 2.0 drop-in replacement for `sqlite3` module |
 | **Rust** | [`sdks/rust/`](sdks/rust/) | HTTP client for remote HeliosDB servers (for embedded use, use `heliosdb-nano` crate directly) |
@@ -25,13 +25,34 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 | **Make** | [`integrations/make/`](integrations/make/) | Module definition for Make.com (Integromat) |
 | **AutoGen** | [`integrations/autogen/`](integrations/autogen/) | Microsoft AutoGen agent integration |
 
+## Installing
+
+The Go module is fetched directly from this repository with `go get` (tags
+`sdks/go/vX.Y.Z`). The Python, TypeScript and Rust SDKs and the integrations
+are not yet published to PyPI, npm or crates.io; install them from source, for
+example:
+
+```bash
+pip install "git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python"
+```
+
+See each SDK's README for details.
+
 ## HeliosDB Editions
 
-| Edition | Repository | Description |
-|---------|-----------|-------------|
-| **Nano** | [HDB-HeliosDB-Nano](https://github.com/Dimensigon/HDB-HeliosDB-Nano) | Embedded/single-user, PostgreSQL-compatible |
-| **Lite** | [HDB-HeliosDB-Lite](https://github.com/dimensigon/HDB-HeliosDB-Lite) | Extended with gRPC and HA scaffolding |
-| **Full** | Coming soon | Enterprise distributed |
+| Edition | Where to find it | Description |
+|---------|------------------|-------------|
+| **Nano** | [HeliosDatabase/HeliosDB-Nano](https://github.com/HeliosDatabase/HeliosDB-Nano) (Apache-2.0) | Embedded / single-node, PostgreSQL-compatible |
+| **Lite** | [Documentation](https://heliosdb.com/docs/lite/) | Self-hosted PostgreSQL-compatible edition |
+| **Full** | [Documentation](https://heliosdb.com/docs/full/) | Distributed enterprise edition |
+
+Related: [HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy) (PostgreSQL-wire proxy, Apache-2.0).
+
+## Support
+
+- Issues: <https://github.com/HeliosDatabase/HeliosDB-SDKs/issues>
+- Discord: <https://discord.gg/yTykuUrFXc>
+- Email: support@heliosdb.com
 
 ## License
 

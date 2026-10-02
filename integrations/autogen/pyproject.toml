@@ -48,9 +48,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Dimensigon/heliosdb-sdks"
-Documentation = "https://heliosdb.dev/integrations/autogen"
-Repository = "https://github.com/Dimensigon/heliosdb-sdks"
+Homepage = "https://heliosdb.com"
+Documentation = "https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/integrations/autogen#readme"
+Repository = "https://github.com/HeliosDatabase/HeliosDB-SDKs"
+Issues = "https://github.com/HeliosDatabase/HeliosDB-SDKs/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/heliosdb_autogen"]
