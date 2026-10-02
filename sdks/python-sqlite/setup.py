@@ -31,7 +31,7 @@ from setuptools.command.install import install
 
 # Package metadata (also defined in pyproject.toml)
 PACKAGE_NAME = "heliosdb-sqlite"
-PACKAGE_VERSION = "3.0.0"
+PACKAGE_VERSION = "3.0.1"
 PACKAGE_DESCRIPTION = (
     "SQLite-compatible interface for HeliosDB with vector search, "
     "encryption, and time-travel queries"

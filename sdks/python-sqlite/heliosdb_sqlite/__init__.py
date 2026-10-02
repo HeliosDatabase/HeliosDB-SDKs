@@ -1,98 +1,118 @@
 """
-HeliosDB-SQLite: SQLite-compatible interface for HeliosDB
+HeliosDB SQLite Compatibility Layer
 
-This package provides a drop-in replacement for Python's sqlite3 module,
-offering enhanced features including:
+Drop-in replacement for Python's sqlite3 module that routes all operations
+to HeliosDB while keeping the sqlite3 DB-API interface.
 
-- Vector search with Product Quantization
-- Transparent data encryption (AES-256-GCM)
-- Time-travel queries (AS OF TIMESTAMP)
-- Database branching (git-like workflows)
-- PostgreSQL-compatible types
-- 100% SQLite API compatibility
+Requires a HeliosDB Nano executable: ``heliosdb-nano`` on PATH, or
+HELIOSDB_BINARY set to its path.
 
-Example:
-    Basic usage (drop-in replacement for sqlite3):
+Usage:
+    # Instead of:
+    # import sqlite3
 
-    >>> import heliosdb_sqlite as sqlite3
-    >>> conn = sqlite3.connect(':memory:')
-    >>> cursor = conn.cursor()
-    >>> cursor.execute('CREATE TABLE users (id INTEGER, name TEXT)')
-    >>> cursor.execute('INSERT INTO users VALUES (?, ?)', (1, 'Alice'))
-    >>> conn.commit()
-    >>> cursor.execute('SELECT * FROM users')
-    >>> print(cursor.fetchall())
-    [(1, 'Alice')]
-    >>> conn.close()
+    # Use:
+    import heliosdb_sqlite as sqlite3
 
-For full documentation, see: https://heliosdb.com/docs/nano/features/sqlite/heliosdb_sqlite_drop_in_guide/
+    # Rest of code remains unchanged
+    conn = sqlite3.connect('mydb.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
 """
 
 from ._version import __version__
-from .connection import Connection, connect
-from .cursor import Cursor
-from .exceptions import (
-    DatabaseError,
-    DataError,
+__author__ = "HeliosDB Team"
+
+from .main import (
+    # Core classes
+    Connection,
+    Cursor,
+    Row,
+
+    # Functions
+    connect,
+    register_adapter,
+    register_converter,
+
+    # Exceptions
     Error,
+    Warning,
+    DatabaseError,
     IntegrityError,
+    ProgrammingError,
+    OperationalError,
+    NotSupportedError,
     InterfaceError,
     InternalError,
-    NotSupportedError,
-    OperationalError,
-    ProgrammingError,
-    Warning,
+    DataError,
+
+    # Constants
+    PARSE_DECLTYPES,
+    PARSE_COLNAMES,
+    SQLITE_OK,
+    SQLITE_ERROR,
+    SQLITE_DENY,
+    SQLITE_IGNORE,
+
+    # Type converters
+    Binary,
+    Date,
+    Time,
+    Timestamp,
+    DateFromTicks,
+    TimeFromTicks,
+    TimestampFromTicks,
+
+    # Version info
+    sqlite_version,
+    sqlite_version_info,
+    version,
+    version_info,
+
+    # Advanced features
+    enable_callback_tracebacks,
+    complete_statement,
+    register_trace_callback,
 )
 from .utils import get_binary_path
 
-# SQLite API compatibility
-PARSE_COLNAMES = 1
-PARSE_DECLTYPES = 2
-SQLITE_OK = 0
-SQLITE_DENY = 1
-SQLITE_IGNORE = 2
-
-# Thread safety level (1 = serialized)
-threadsafety = 1
-
-# DB-API 2.0 compliance
-apilevel = "2.0"
-paramstyle = "qmark"  # Support both ? and named parameters
-
-# Version information
-version_info = tuple(map(int, __version__.split(".")))
-sqlite_version = "3.43.0"  # SQLite API compatibility version
-sqlite_version_info = (3, 43, 0)
-
 __all__ = [
-    # Core API
-    "connect",
-    "Connection",
-    "Cursor",
-    # Exceptions
-    "Error",
-    "Warning",
-    "InterfaceError",
-    "DatabaseError",
-    "DataError",
-    "OperationalError",
-    "IntegrityError",
-    "InternalError",
-    "ProgrammingError",
-    "NotSupportedError",
-    # Utilities
-    "get_binary_path",
-    # Constants
-    "PARSE_COLNAMES",
-    "PARSE_DECLTYPES",
-    "SQLITE_OK",
-    "SQLITE_DENY",
-    "SQLITE_IGNORE",
-    "apilevel",
-    "threadsafety",
-    "paramstyle",
-    "version_info",
-    "sqlite_version",
-    "sqlite_version_info",
-    "__version__",
+    'Connection',
+    'Cursor',
+    'Row',
+    'connect',
+    'register_adapter',
+    'register_converter',
+    'Error',
+    'Warning',
+    'DatabaseError',
+    'IntegrityError',
+    'ProgrammingError',
+    'OperationalError',
+    'NotSupportedError',
+    'InterfaceError',
+    'InternalError',
+    'DataError',
+    'PARSE_DECLTYPES',
+    'PARSE_COLNAMES',
+    'SQLITE_OK',
+    'SQLITE_ERROR',
+    'SQLITE_DENY',
+    'SQLITE_IGNORE',
+    'Binary',
+    'Date',
+    'Time',
+    'Timestamp',
+    'DateFromTicks',
+    'TimeFromTicks',
+    'TimestampFromTicks',
+    'sqlite_version',
+    'sqlite_version_info',
+    'version',
+    'version_info',
+    'enable_callback_tracebacks',
+    'complete_statement',
+    'register_trace_callback',
+    'get_binary_path',
+    '__version__',
 ]

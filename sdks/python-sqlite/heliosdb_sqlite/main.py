@@ -110,6 +110,32 @@ class NotSupportedError(DatabaseError):
 # TYPE ADAPTERS - Binary, Date, Time, Timestamp
 # ============================================================================
 
+def _resolve_binary() -> str:
+    """Locate the HeliosDB Nano executable used by embedded/hybrid modes.
+
+    Order: $HELIOSDB_BINARY, ``heliosdb-nano`` on PATH, legacy ``heliosdb``
+    on PATH, then a binary bundled in the package's ``binaries/`` directory.
+    """
+    import shutil
+    explicit = os.environ.get('HELIOSDB_BINARY')
+    if explicit:
+        return explicit
+    for name in ('heliosdb-nano', 'heliosdb'):
+        found = shutil.which(name)
+        if found:
+            return found
+    try:
+        from .utils import get_binary_path
+        return str(get_binary_path())
+    except Exception:
+        pass
+    raise InterfaceError(
+        "HeliosDB Nano executable not found. Install heliosdb-nano "
+        "(https://github.com/HeliosDatabase/HeliosDB-Nano/releases) and put it "
+        "on PATH, or set HELIOSDB_BINARY to its full path."
+    )
+
+
 def Binary(data: bytes) -> bytes:
     """Construct binary data for SQL insertion."""
     return data
@@ -728,7 +754,7 @@ class Connection:
         import subprocess
         import os
         import fcntl
-        cmd = ['heliosdb', 'repl'] + self._heliosdb_args
+        cmd = [_resolve_binary(), 'repl'] + self._heliosdb_args
 
         try:
             self._heliosdb_process = subprocess.Popen(
@@ -1301,7 +1327,7 @@ class Connection:
         # Start server daemon
         data_dir = self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
         cmd = [
-            'heliosdb', 'start',
+            _resolve_binary(), 'start',
             '--data-dir', data_dir,
             '--port', str(port),
             '--daemon'

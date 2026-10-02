@@ -4,21 +4,19 @@ This guide will help you get started with the HeliosDB SQLite compatibility laye
 
 ## Installation
 
-### Option 1: Install from PyPI (when published)
+### Option 1: Install from GitHub
 ```bash
-pip install heliosdb-sqlite
+pip install "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
 ```
 
-### Option 2: Install from Source
+### Option 2: Install from a source checkout
 ```bash
-cd /home/claude/HeliosDB/sdks/python
-pip install -e .
+git clone https://github.com/HeliosDatabase/HeliosDB-SDKs.git
+pip install ./HeliosDB-SDKs/sdks/python-sqlite
 ```
 
-### Option 3: Copy Module
-```bash
-cp -r heliosdb_sqlite /path/to/your/project/
-```
+The package drives a local `heliosdb-nano` executable: put it on `PATH`
+or set `HELIOSDB_BINARY` to its full path.
 
 ## Prerequisites
 

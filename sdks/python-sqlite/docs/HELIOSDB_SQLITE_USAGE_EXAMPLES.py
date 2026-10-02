@@ -761,7 +761,7 @@ def run_all_examples():
     print("  4. ✅ Multi-mode: embedded, daemon, hybrid")
     print("  5. ✅ Production-ready: transactions, error handling")
     print("\nGet started:")
-    print("  pip install heliosdb-sqlite")
+    print("  pip install 'heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite'")
     print("  import heliosdb_sqlite as sqlite3")
     print("\n" + "=" * 70)
 

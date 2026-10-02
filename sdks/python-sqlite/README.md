@@ -8,13 +8,13 @@
 
 ## Features
 
-- **100% SQLite API Compatibility** - Drop-in replacement for Python's `sqlite3` module
+- **sqlite3 DB-API interface** - Drop-in replacement for Python's `sqlite3` module, including `cursor.lastrowid`
 - **Vector Search** - Built-in vector search with Product Quantization (8-16x compression)
 - **Transparent Encryption** - AES-256-GCM encryption with <3% overhead
 - **Time-Travel Queries** - Access historical data with `AS OF TIMESTAMP`
 - **Database Branching** - Git-like workflows for schema changes
 - **PostgreSQL Types** - Extended type support (JSONB, UUID, VECTOR)
-- **Zero Dependencies** - Pure Python with bundled HeliosDB binary
+- **Zero Python Dependencies** - Pure Python; talks to a local HeliosDB Nano executable
 - **Cross-Platform** - Linux, macOS, Windows support
 
 ---
@@ -23,6 +23,21 @@
 
 `heliosdb-sqlite` is not yet published on PyPI; install it from the
 [HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository.
+
+### Requirement: the HeliosDB Nano executable
+
+The package is pure Python and drives a local `heliosdb-nano` process
+(`heliosdb-nano repl`). Download `heliosdb-nano` from the
+[HeliosDB-Nano releases](https://github.com/HeliosDatabase/HeliosDB-Nano/releases)
+and put it on your `PATH`, or point `HELIOSDB_BINARY` at it:
+
+```bash
+export HELIOSDB_BINARY=/opt/heliosdb/heliosdb-nano
+```
+
+Lookup order: `$HELIOSDB_BINARY`, `heliosdb-nano` on `PATH`, `heliosdb` on
+`PATH`, then a binary bundled under `heliosdb_sqlite/binaries/` (none is
+bundled by the source install below).
 
 ### Standard Installation
 
@@ -47,7 +62,7 @@ pip install "heliosdb-sqlite[all] @ git+https://github.com/HeliosDatabase/Helios
 
 ```bash
 python -c "import heliosdb_sqlite; print(heliosdb_sqlite.__version__)"
-# Output: 3.0.0
+# Output: 3.0.1
 
 # Run comprehensive tests
 python -m heliosdb_sqlite.cli check
@@ -224,6 +239,23 @@ for row in cursor:
     print(row)
 ```
 
+### `cursor.lastrowid`
+
+After an `INSERT` into a table whose primary key is an integer column
+(`INTEGER`, `BIGINT`, `SERIAL`, ...), `cursor.lastrowid` holds the key of
+the inserted row, as in `sqlite3`. For a multi-row `INSERT` it is the key of
+the last row. Tables without an integer primary key leave it `None`.
+
+```python
+cur.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
+cur.execute("INSERT INTO users (name) VALUES (?)", ("Alice",))
+print(cur.lastrowid)  # 1
+```
+
+The layer appends `RETURNING <pk>` to the `INSERT` and hides that result
+set. The primary-key column is looked up once per table and cached. To turn
+the rewrite off, use `connect(..., lastrowid=False)`.
+
 ### Exception Handling
 
 ```python
@@ -315,34 +347,19 @@ finally:
 
 ## Troubleshooting
 
-### Binary Not Found
+### HeliosDB Nano executable not found
+
+`InterfaceError: HeliosDB Nano executable not found` means neither
+`$HELIOSDB_BINARY` nor `heliosdb-nano` on `PATH` could be found:
 
 ```bash
-# Reinstall package
-pip install --force-reinstall --no-cache-dir "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
-
-# Check binary location
-python -c "import heliosdb_sqlite; print(heliosdb_sqlite.get_binary_path())"
+which heliosdb-nano            # should print a path
+heliosdb-nano --version
+export HELIOSDB_BINARY=/full/path/to/heliosdb-nano   # alternative to PATH
 ```
 
-### Permission Denied (Unix/macOS)
-
-```bash
-# Make binary executable
-python -c "import heliosdb_sqlite; import os; os.chmod(heliosdb_sqlite.get_binary_path(), 0o755)"
-```
-
-### Platform Not Supported
-
-If your platform doesn't have pre-built wheels, you can build from source:
-
-```bash
-# Install Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build from source
-pip install --no-binary heliosdb-sqlite "heliosdb-sqlite @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
-```
+The official Linux release binaries need glibc 2.39 or newer. On older
+distributions, run inside a newer base image such as `debian:trixie-slim`.
 
 ---
 

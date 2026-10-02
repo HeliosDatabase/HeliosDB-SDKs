@@ -445,7 +445,7 @@ class InstallationTester:
 
         if not any_installed:
             self.print_info("No optional dependencies installed")
-            self.print_info("Install with: pip install heliosdb-sqlite[all]")
+            self.print_info("Install with: pip install 'heliosdb-sqlite[all] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite'")
 
         return True  # Optional dependencies are not required
 
