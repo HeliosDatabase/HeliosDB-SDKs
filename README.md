@@ -9,6 +9,7 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 | Language | Path | Features |
 |----------|------|----------|
 | **Go** | [`sdks/go/`](sdks/go/) | Branches, vector search, agent memory, time-travel — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go@latest` |
+| **Go (WASM procedures)** | [`sdks/go/wasm/`](sdks/go/wasm/) | Write HeliosDB Full stored procedures in Go, compile with TinyGo — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm@latest` |
 | **Python** | [`sdks/python/`](sdks/python/) | Full-featured: vectors, agents, branches, LangChain + LlamaIndex integrations |
 | **Python (SQLite compat)** | [`sdks/python-sqlite/`](sdks/python-sqlite/) | DB-API 2.0 drop-in replacement for `sqlite3` module |
 | **Rust** | [`sdks/rust/`](sdks/rust/) | HTTP client for remote HeliosDB servers (for embedded use, use `heliosdb-nano` crate directly) |
@@ -27,8 +28,8 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 
 ## Installing
 
-The Go module is fetched directly from this repository with `go get` (tags
-`sdks/go/vX.Y.Z`). The Python, TypeScript and Rust SDKs and the integrations
+The Go modules are fetched directly from this repository with `go get` (tags
+`sdks/go/vX.Y.Z` and `sdks/go/wasm/vX.Y.Z`). The Python, TypeScript and Rust SDKs and the integrations
 are not yet published to PyPI, npm or crates.io; install them from source, for
 example:
 

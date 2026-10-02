@@ -7,6 +7,9 @@ HeliosDB edition that exposes the REST API (Nano, Lite, Full).
 For plain SQL over the PostgreSQL wire protocol you can also use any standard
 Go PostgreSQL driver, such as [pgx](https://github.com/jackc/pgx).
 
+To write HeliosDB Full stored procedures in Go (compiled to WebAssembly), see
+the separate module in [`wasm/`](wasm/).
+
 ## Install
 
 ```bash
