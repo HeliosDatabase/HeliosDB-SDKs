@@ -151,6 +151,11 @@ Complete API documentation available in [HELIOSDB_SQLITE_API_REFERENCE.md](../HE
 - **`Cursor`** - Query execution and result management
   - `execute()`, `fetchone()`, `fetchall()`, `fetchmany()`
   - `executemany()`, `executescript()`
+  - `lastrowid` - set after an `INSERT` into a table with an integer
+    primary key (`INTEGER`, `BIGINT`, `SERIAL`, ...). The layer appends
+    `RETURNING <pk>` to the statement and hides the synthesised result
+    set, so `cursor.lastrowid` behaves as in `sqlite3`. Tables without an
+    integer PK leave it `None`. Opt out with `connect(..., lastrowid=False)`.
 
 - **`Row`** - Result row with index and name-based access
   - `row[0]`, `row['column_name']`, `row.keys()`

@@ -14,7 +14,7 @@ Architecture:
 
 Author: HeliosDB Team
 Version: 3.0.1
-License: MIT
+License: Apache-2.0
 """
 
 import sys
@@ -239,6 +239,18 @@ class Cursor:
     Fully compatible with sqlite3.Cursor API.
     """
 
+    # Pre-compiled patterns for the INSERT detector. Anchored at the start
+    # so we don't trip on `WITH ... INSERT INTO ...` CTEs (which don't need
+    # rewriting because the user already supplied RETURNING semantics) and
+    # so multi-statement strings sent through `executescript` don't double-
+    # count.
+    _INSERT_RE = re.compile(
+        r'^\s*INSERT\s+(?:OR\s+(?:REPLACE|IGNORE)\s+)?INTO\s+'
+        r'("(?P<qname>[^"]+)"|(?P<pname>[A-Za-z_][\w\.]*))',
+        re.IGNORECASE | re.DOTALL,
+    )
+    _RETURNING_RE = re.compile(r'\bRETURNING\b', re.IGNORECASE)
+
     def __init__(self, connection: 'Connection'):
         """
         Initialize cursor.
@@ -254,6 +266,78 @@ class Cursor:
         self._results = []
         self._result_index = 0
         self.row_factory = None
+
+    def _resolve_lastrowid_pk(self, table: str) -> Optional[str]:
+        """Find the integer-typed primary-key column for `table`, if any.
+
+        Result is cached on the parent Connection across cursors so a busy
+        loop of inserts doesn't pay the catalog round-trip per row.
+        Returns ``None`` for tables with no PK, a non-integer PK
+        (e.g. TEXT keys), or when the catalog lookup fails.
+        """
+        cache = self.connection._lastrowid_pk_cache
+        if table in cache:
+            return cache[table]
+
+        # Run PRAGMA table_info via a fresh internal cursor to avoid
+        # clobbering our own state. The PRAGMA path is short-circuited by
+        # the engine and never re-enters this rewriter (PRAGMA != INSERT).
+        try:
+            probe = Cursor(self.connection)
+            probe.execute(f"PRAGMA table_info({table})")
+            pk_col: Optional[str] = None
+            for row in probe._results:
+                # PRAGMA shape: (cid, name, type, notnull, dflt_value, pk)
+                # Both the embedded REPL and the daemon path return strings
+                # for the type field; treat anything containing INT as a
+                # candidate. Composite PKs pick the first int column.
+                try:
+                    is_pk = int(row[5]) if row[5] is not None else 0
+                except (TypeError, ValueError):
+                    is_pk = 0
+                if not is_pk:
+                    continue
+                col_type = (row[2] or '').upper()
+                if 'INT' in col_type or 'SERIAL' in col_type:
+                    pk_col = row[1]
+                    break
+            cache[table] = pk_col
+            return pk_col
+        except Exception:
+            cache[table] = None
+            return None
+
+    def _maybe_inject_returning(self, sql: str) -> Tuple[str, Optional[str]]:
+        """Rewrite `INSERT INTO t (...) VALUES (...)` →
+        `INSERT INTO t (...) VALUES (...) RETURNING <pk>` so the engine
+        echoes the inserted PK back. Caller stores the returned value as
+        `cursor.lastrowid`.
+
+        Returns ``(sql, pk_column or None)``. ``pk_column`` is None when no
+        rewrite was applied (already has RETURNING, or the table has no
+        int PK).
+        """
+        if self.connection._lastrowid_disabled:
+            return sql, None
+        m = self._INSERT_RE.match(sql)
+        if not m:
+            return sql, None
+        if self._RETURNING_RE.search(sql):
+            return sql, None
+        table = m.group('qname') or m.group('pname') or ''
+        # Drop schema prefix (`public.users` → `users`); PRAGMA table_info
+        # is name-only.
+        table = table.rsplit('.', 1)[-1]
+        if not table:
+            return sql, None
+        pk_col = self._resolve_lastrowid_pk(table)
+        if not pk_col:
+            return sql, None
+        # Strip a trailing ';' before appending RETURNING — the SDK adds
+        # the semicolon back on the wire. Anything else after the values
+        # list (ON CONFLICT, etc.) is preserved as-is.
+        body = sql.rstrip().rstrip(';')
+        return f'{body} RETURNING "{pk_col}"', pk_col
 
     def execute(self, sql: str, parameters: Union[Tuple, Dict] = ()) -> 'Cursor':
         """
@@ -285,6 +369,18 @@ class Cursor:
         # Bind parameters
         bound_sql = self._bind_parameters(sql, parameters)
 
+        # sqlite3.Cursor.lastrowid: when the user runs an INSERT we
+        # transparently append RETURNING <pk> so the engine hands the new
+        # row's PK back. Standard PostgreSQL feature — works in both
+        # embedded and daemon mode, no engine state needed. Per
+        # sqlite3 semantics, lastrowid is cleared on every INSERT and
+        # left untouched on non-INSERT statements; clearing once when we
+        # detect an INSERT (whether or not the rewrite applies) matches
+        # that contract for tables without an int PK.
+        if self._INSERT_RE.match(bound_sql):
+            self.lastrowid = None
+        bound_sql, lastrowid_pk = self._maybe_inject_returning(bound_sql)
+
         # Execute through connection
         try:
             results = self.connection._execute_sql(bound_sql)
@@ -306,6 +402,29 @@ class Cursor:
                     self.description = None
 
                 self.rowcount = len(self._results)
+
+                # If we injected RETURNING <pk>, capture the last row's
+                # value as cursor.lastrowid. Multi-row INSERTs follow
+                # sqlite3 semantics: lastrowid = the most recent insert.
+                if lastrowid_pk and self._results:
+                    last_row = self._results[-1]
+                    pk_idx = 0
+                    if columns and lastrowid_pk in columns:
+                        pk_idx = columns.index(lastrowid_pk)
+                    if pk_idx < len(last_row):
+                        try:
+                            self.lastrowid = int(last_row[pk_idx])
+                        except (TypeError, ValueError):
+                            self.lastrowid = None
+                    # Hide the synthesised RETURNING from the caller —
+                    # they ran an INSERT, they expect rowcount/None
+                    # description, not query results. rowcount is the
+                    # number of inserted rows, as in sqlite3.
+                    inserted = len(self._results)
+                    self._results = []
+                    self._result_index = 0
+                    self.description = None
+                    self.rowcount = inserted
             else:
                 # Command result (INSERT, UPDATE, DELETE, etc.)
                 self._results = []
@@ -547,6 +666,16 @@ class Connection:
         self._in_transaction = False
         self._thread_id = threading.get_ident() if check_same_thread else None
 
+        # cursor.lastrowid support: cache the int-PK column name per table
+        # so we don't issue PRAGMA table_info on every INSERT. Pass
+        # `lastrowid=False` (or `lastrowid_disabled=True`) to connect() to
+        # opt out of the auto-RETURNING rewrite.
+        self._lastrowid_pk_cache: Dict[str, Optional[str]] = {}
+        self._lastrowid_disabled: bool = bool(
+            kwargs.get('lastrowid_disabled', False)
+            or kwargs.get('lastrowid', True) is False
+        )
+
         # HeliosDB-specific configuration
         self._mode = kwargs.get('mode', 'embedded')  # embedded, daemon, hybrid
         self._data_dir = kwargs.get('data_dir', None)
@@ -681,8 +810,15 @@ class Connection:
             self._start_persistent_repl()
 
         try:
-            # Send SQL command to the REPL
-            self._heliosdb_process.stdin.write((sql + '\n').encode('utf-8'))
+            # Send SQL command to the REPL. The HeliosDB REPL waits for a
+            # trailing `;` to terminate a statement (multi-line input is
+            # buffered until then), so make sure one is present even when
+            # the caller forgot. Backslash meta-commands (\d, \q, …) are
+            # passed through verbatim.
+            stmt = sql.rstrip()
+            if stmt and not stmt.startswith('\\') and not stmt.endswith(';'):
+                stmt += ';'
+            self._heliosdb_process.stdin.write((stmt + '\n').encode('utf-8'))
             self._heliosdb_process.stdin.flush()
 
             # Read response with non-blocking I/O
@@ -812,9 +948,18 @@ class Connection:
         Returns:
             Dict with rows/columns for SELECT, int for other statements
         """
-        # Detect query type
+        # Detect query type. PRAGMA may return rows (e.g. table_info) or
+        # be a no-op tunable; in either case we let the table-parsing path
+        # run so callers get column-shaped results back.
         sql_upper = sql.strip().upper()
-        is_query = sql_upper.startswith('SELECT') or sql_upper.startswith('WITH')
+        is_query = (
+            sql_upper.startswith('SELECT')
+            or sql_upper.startswith('WITH')
+            or sql_upper.startswith('PRAGMA')
+            or sql_upper.startswith('VALUES')
+            or sql_upper.startswith('SHOW')
+            or 'RETURNING' in sql_upper
+        )
 
         if is_query:
             # Parse table output
@@ -832,40 +977,51 @@ class Connection:
                     separator_indices.append(i)
 
             if len(separator_indices) >= 2:
-                # Extract column names from header line (before first separator)
-                header_line = lines[separator_indices[0] - 1] if separator_indices[0] > 0 else ""
+                # The HeliosDB REPL emits a box-drawn table where:
+                #   - sep[0] is the top rule (┌──┐)
+                #   - sep[1] is the header/data divider (├──┤)
+                #   - sep[2..-1] are between-row dividers (when prettytable
+                #     is set to FORMAT_BOX_CHARS, every data row gets one)
+                #   - sep[-1] is the bottom rule (└──┘)
+                # Header lives between sep[0] and sep[1]; data rows live
+                # between sep[1] and sep[-1], excluding any intermediate
+                # separators.
+                top, header_div, bottom = separator_indices[0], separator_indices[1], separator_indices[-1]
+                separator_set = set(separator_indices)
 
-                # Try Unicode box drawing delimiter first, then ASCII pipe
-                if '│' in header_line:
-                    columns = [col.strip() for col in header_line.split('│') if col.strip()]
-                elif '|' in header_line:
-                    columns = [col.strip() for col in header_line.split('|') if col.strip()]
-                else:
-                    # Whitespace-separated columns (fallback)
-                    columns = header_line.split()
+                columns = []
+                for i in range(top + 1, header_div):
+                    if i >= len(lines):
+                        break
+                    line = lines[i]
+                    if '│' in line:
+                        cells = [c.strip() for c in line.split('│') if c.strip()]
+                    elif '|' in line:
+                        cells = [c.strip() for c in line.split('|') if c.strip()]
+                    else:
+                        cells = line.split()
+                    if cells:
+                        columns = cells
+                        break
 
-                # Extract data rows between first and second separator
                 rows = []
-                for i in range(separator_indices[0] + 1, separator_indices[1]):
-                    if i < len(lines):
-                        row_line = lines[i]
-                        # Parse based on delimiter type
-                        if '│' in row_line:
-                            values = [val.strip() for val in row_line.split('│') if val.strip()]
-                        elif '|' in row_line:
-                            values = [val.strip() for val in row_line.split('|') if val.strip()]
-                        else:
-                            # Skip empty or malformed lines
-                            continue
-
-                        if values:
-                            # Convert NULL strings to None
-                            values = [None if v.upper() == 'NULL' else v for v in values]
-                            rows.append(values)
+                for i in range(header_div + 1, bottom):
+                    if i in separator_set or i >= len(lines):
+                        continue
+                    row_line = lines[i]
+                    if '│' in row_line:
+                        values = [v.strip() for v in row_line.split('│') if v.strip()]
+                    elif '|' in row_line:
+                        values = [v.strip() for v in row_line.split('|') if v.strip()]
+                    else:
+                        continue
+                    if values:
+                        values = [None if v.upper() == 'NULL' else v for v in values]
+                        rows.append(values)
 
                 return {
                     'rows': rows,
-                    'columns': columns
+                    'columns': columns,
                 }
             else:
                 # No table format - check for "(0 rows)" pattern indicating empty result
