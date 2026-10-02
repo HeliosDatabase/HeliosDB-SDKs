@@ -9,41 +9,51 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
 const (
 	i32 = api.ValueTypeI32
 	i64 = api.ValueTypeI64
+	f64 = api.ValueTypeF64
 )
 
 type sig struct{ params, results []api.ValueType }
 
-// hostABI is the "heliosdb" import module as implemented by the HeliosDB
-// Full procedure host.
+func ts(v ...api.ValueType) []api.ValueType { return v }
+
+// hostABI is every function HeliosDB Full's WASM host registers in the "env"
+// module (heliosdb-wasm/src/host.rs, HostFunctions::register), with the exact
+// wasmtime signatures. The host's linker provides nothing else: no WASI.
 var hostABI = map[string]sig{
-	"exec_sql":             {[]api.ValueType{i32, i32}, []api.ValueType{i32}},
-	"exec_prepared":        {[]api.ValueType{i64}, []api.ValueType{i32}},
-	"begin_transaction":    {nil, []api.ValueType{i64}},
-	"commit_transaction":   {[]api.ValueType{i64}, []api.ValueType{i32}},
-	"rollback_transaction": {[]api.ValueType{i64}, []api.ValueType{i32}},
-	"kv_get":               {[]api.ValueType{i32, i32, i32}, []api.ValueType{i32}},
-	"kv_set":               {[]api.ValueType{i32, i32, i32, i32}, []api.ValueType{i32}},
-	"kv_delete":            {[]api.ValueType{i32, i32}, []api.ValueType{i32}},
-	"log":                  {[]api.ValueType{i32, i32, i32}, []api.ValueType{i32}},
-	"hash":                 {[]api.ValueType{i32, i32, i32, i32}, []api.ValueType{i32}},
-	"random_bytes":         {[]api.ValueType{i32, i32}, []api.ValueType{i32}},
-	"result_row_count":     {[]api.ValueType{i32}, []api.ValueType{i32}},
-	"result_free":          {[]api.ValueType{i32}, nil},
+	"log_i32":                {ts(i32), nil},
+	"log_i64":                {ts(i64), nil},
+	"log_f64":                {ts(f64), nil},
+	"add_i32":                {ts(i32, i32), ts(i32)},
+	"multiply_i64":           {ts(i64, i64), ts(i64)},
+	"heliosdb_query":         {ts(i32, i32, i32, i32), ts(i32)},
+	"heliosdb_execute":       {ts(i32, i32), ts(i64)},
+	"heliosdb_log":           {ts(i32, i32, i32), ts(i32)},
+	"heliosdb_storage_read":  {ts(i32, i32, i32, i32), ts(i32)},
+	"heliosdb_storage_write": {ts(i32, i32, i32, i32), ts(i32)},
+	"heliosdb_begin_tx":      {nil, ts(i64)},
+	"heliosdb_commit_tx":     {ts(i64), ts(i32)},
+	"heliosdb_rollback_tx":   {ts(i64), ts(i32)},
+	"heliosdb_fetch_rows":    {ts(i64, i32, i32, i32), ts(i32)},
+	"heliosdb_emit_event":    {ts(i32, i32, i32, i32), ts(i32)},
 }
 
+// unsafeImports write results at a host-chosen guest address (64 KiB and
+// up), which is where TinyGo puts the module's data segment. The SDK must
+// never import them.
+var unsafeImports = []string{"heliosdb_query", "heliosdb_storage_read", "heliosdb_fetch_rows"}
+
 var exampleExports = map[string]sig{
-	"apply_discount":  {[]api.ValueType{i64, i32}, []api.ValueType{i64}},
-	"record_order":    {[]api.ValueType{i64, i64}, []api.ValueType{i32}},
-	"orders_recorded": {nil, []api.ValueType{i64}},
+	"apply_discount": {ts(i64, i32), ts(i64)},
+	"record_order":   {ts(i64, i64), ts(i32)},
 }
 
 func tinygo(t *testing.T) string {
@@ -84,91 +94,93 @@ func sameTypes(a, b []api.ValueType) bool {
 	return true
 }
 
-// fakeHost records what the guest asked the host to do.
+// fakeHost implements the env functions the SDK uses, with host.rs return
+// codes, reading arguments from guest memory like the real host.
 type fakeHost struct {
 	sql      []string
 	logs     []string
 	tx       []string
-	kv       map[string][]byte
-	results  map[uint32]int
-	nextRes  uint32
+	kv       map[string]string
+	open     map[int64]bool
 	nextTx   int64
-	denySQL  bool
-	hashSeen int
+	failExec bool
 }
 
 func newFakeHost() *fakeHost {
-	return &fakeHost{kv: map[string][]byte{}, results: map[uint32]int{}, nextRes: 1, nextTx: 1}
+	return &fakeHost{kv: map[string]string{}, open: map[int64]bool{}, nextTx: 1}
 }
 
-func read(m api.Module, ptr, n uint32) []byte {
+func read(m api.Module, ptr, n uint32) ([]byte, bool) {
 	b, ok := m.Memory().Read(ptr, n)
 	if !ok {
-		panic(fmt.Sprintf("guest pointer out of range: %d+%d", ptr, n))
+		return nil, false
 	}
-	return append([]byte(nil), b...)
+	return append([]byte(nil), b...), true
 }
 
 func (h *fakeHost) instantiate(ctx context.Context, r wazero.Runtime) error {
-	b := r.NewHostModuleBuilder("heliosdb")
+	b := r.NewHostModuleBuilder("env")
 	fn := func(name string, f interface{}) { b.NewFunctionBuilder().WithFunc(f).Export(name) }
-	fn("exec_sql", func(ctx context.Context, m api.Module, p, n uint32) int32 {
-		if h.denySQL {
+	fn("heliosdb_execute", func(ctx context.Context, m api.Module, p, n int32) int64 {
+		if p < 0 || n < 0 {
+			return -3
+		}
+		s, ok := read(m, uint32(p), uint32(n))
+		if !ok {
+			return -3
+		}
+		if !utf8.Valid(s) {
 			return -1
 		}
-		h.sql = append(h.sql, string(read(m, p, n)))
-		id := h.nextRes
-		h.nextRes++
-		h.results[id] = 1
-		return int32(id)
+		if h.failExec {
+			return -2
+		}
+		h.sql = append(h.sql, string(s))
+		return 1
 	})
-	fn("exec_prepared", func(int64) int32 { return -1 })
-	fn("begin_transaction", func() int64 {
+	fn("heliosdb_begin_tx", func() int64 {
 		id := h.nextTx
 		h.nextTx++
+		h.open[id] = true
 		h.tx = append(h.tx, "begin:"+strconv.FormatInt(id, 10))
 		return id
 	})
-	fn("commit_transaction", func(id int64) int32 { h.tx = append(h.tx, "commit:"+strconv.FormatInt(id, 10)); return 0 })
-	fn("rollback_transaction", func(id int64) int32 { h.tx = append(h.tx, "rollback:"+strconv.FormatInt(id, 10)); return 0 })
-	fn("kv_get", func(ctx context.Context, m api.Module, kp, kn, vp uint32) int32 {
-		v, ok := h.kv[string(read(m, kp, kn))]
-		if !ok {
-			return 0
+	finish := func(op string, id int64) int32 {
+		if !h.open[id] {
+			return 1
 		}
-		if !m.Memory().Write(vp, v) {
-			return -1
+		delete(h.open, id)
+		h.tx = append(h.tx, op+":"+strconv.FormatInt(id, 10))
+		return 0
+	}
+	fn("heliosdb_commit_tx", func(id int64) int32 { return finish("commit", id) })
+	fn("heliosdb_rollback_tx", func(id int64) int32 { return finish("rollback", id) })
+	fn("heliosdb_storage_write", func(ctx context.Context, m api.Module, kp, kn, vp, vn int32) int32 {
+		k, ok1 := read(m, uint32(kp), uint32(kn))
+		v, ok2 := read(m, uint32(vp), uint32(vn))
+		if !ok1 || !ok2 {
+			return 3
 		}
-		return int32(len(v))
-	})
-	fn("kv_set", func(ctx context.Context, m api.Module, kp, kn, vp, vn uint32) int32 {
-		h.kv[string(read(m, kp, kn))] = read(m, vp, vn)
+		if !utf8.Valid(k) {
+			return 1
+		}
+		h.kv[string(k)] = string(v)
 		return 0
 	})
-	fn("kv_delete", func(ctx context.Context, m api.Module, kp, kn uint32) int32 {
-		delete(h.kv, string(read(m, kp, kn)))
-		return 0
-	})
-	fn("log", func(ctx context.Context, m api.Module, level int32, p, n uint32) int32 {
+	fn("heliosdb_log", func(ctx context.Context, m api.Module, level, p, n int32) int32 {
 		if level < 0 || level > 4 {
-			return -1
+			return 2
 		}
-		h.logs = append(h.logs, strconv.Itoa(int(level))+":"+string(read(m, p, n)))
+		s, ok := read(m, uint32(p), uint32(n))
+		if !ok {
+			return 3
+		}
+		if !utf8.Valid(s) {
+			return 1
+		}
+		h.logs = append(h.logs, strconv.Itoa(int(level))+":"+string(s))
 		return 0
 	})
-	fn("hash", func(ctx context.Context, m api.Module, alg int32, dp, dn, op uint32) int32 {
-		h.hashSeen++
-		return -1
-	})
-	fn("random_bytes", func(ctx context.Context, m api.Module, op uint32, n int32) int32 { return 0 })
-	fn("result_row_count", func(id uint32) int32 {
-		n, ok := h.results[id]
-		if !ok {
-			return -1
-		}
-		return int32(n)
-	})
-	fn("result_free", func(id uint32) { delete(h.results, id) })
 	_, err := b.Instantiate(ctx)
 	return err
 }
@@ -181,20 +193,23 @@ func checkABI(t *testing.T, ctx context.Context, r wazero.Runtime, bin []byte) w
 	}
 	for _, f := range cm.ImportedFunctions() {
 		mod, name, _ := f.Import()
-		switch mod {
-		case wasi_snapshot_preview1.ModuleName:
-		case "heliosdb":
-			want, ok := hostABI[name]
-			if !ok {
-				t.Errorf("import heliosdb.%s is not part of the host ABI", name)
-				continue
+		if mod != "env" {
+			t.Errorf("import %s.%s: the HeliosDB host links only the \"env\" module (no WASI)", mod, name)
+			continue
+		}
+		want, ok := hostABI[name]
+		if !ok {
+			t.Errorf("import env.%s is not registered by the HeliosDB host", name)
+			continue
+		}
+		if !sameTypes(f.ParamTypes(), want.params) || !sameTypes(f.ResultTypes(), want.results) {
+			t.Errorf("import env.%s: signature %v -> %v, host has %v -> %v",
+				name, f.ParamTypes(), f.ResultTypes(), want.params, want.results)
+		}
+		for _, u := range unsafeImports {
+			if name == u {
+				t.Errorf("import env.%s writes to a host-chosen guest address and must not be used", name)
 			}
-			if !sameTypes(f.ParamTypes(), want.params) || !sameTypes(f.ResultTypes(), want.results) {
-				t.Errorf("import heliosdb.%s: signature %v -> %v, host has %v -> %v",
-					name, f.ParamTypes(), f.ResultTypes(), want.params, want.results)
-			}
-		default:
-			t.Errorf("unexpected import module %q (%s)", mod, name)
 		}
 	}
 	if _, ok := cm.ExportedMemories()["memory"]; !ok {
@@ -227,14 +242,14 @@ func run(t *testing.T, bin []byte) {
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
 	defer r.Close(ctx)
-	wasi_snapshot_preview1.MustInstantiate(ctx, r)
+	// Like heliosdb-wasm's WasmInstance: a linker with only the env host
+	// functions, instantiate, then call exports directly (no _start or
+	// _initialize).
 	h := newFakeHost()
 	if err := h.instantiate(ctx, r); err != nil {
 		t.Fatal(err)
 	}
 	cm := checkABI(t, ctx, r, bin)
-	// Like the HeliosDB procedure runtime: instantiate and call exports
-	// directly, without running _start or _initialize.
 	m, err := r.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithStartFunctions())
 	if err != nil {
 		t.Fatal(err)
@@ -243,40 +258,54 @@ func run(t *testing.T, bin []byte) {
 	if got := int64(call(t, ctx, m, "apply_discount", api.EncodeI64(1000), api.EncodeI32(10))); got != 900 {
 		t.Errorf("apply_discount = %d", got)
 	}
-	for _, args := range [][2]int64{{7, 1999}, {8, 500}} {
-		if rc := api.DecodeI32(call(t, ctx, m, "record_order", api.EncodeI64(args[0]), api.EncodeI64(args[1]))); rc != 0 {
-			t.Fatalf("record_order%v = %d (logs %v)", args, rc, h.logs)
+	// Call many times so the conservative GC has to run inside the guest.
+	for i := int64(1); i <= 300; i++ {
+		if rc := api.DecodeI32(call(t, ctx, m, "record_order", api.EncodeI64(i), api.EncodeI64(100+i))); rc != 0 {
+			t.Fatalf("record_order(%d) = %d (logs %v)", i, rc, h.logs)
 		}
 	}
-	if got := int64(call(t, ctx, m, "orders_recorded")); got != 2 {
-		t.Errorf("orders_recorded = %d", got)
+	if len(h.sql) != 300 || h.sql[0] != "INSERT INTO orders (customer_id, amount_cents) VALUES (1, 101)" {
+		t.Errorf("sql[0] = %q (n=%d)", h.sql[0], len(h.sql))
 	}
-	if len(h.sql) != 2 || h.sql[0] != "INSERT INTO orders (customer_id, amount_cents) VALUES (7, 1999)" {
-		t.Errorf("sql = %q", h.sql)
+	if !strings.HasPrefix(strings.Join(h.tx, ","), "begin:1,commit:1,begin:2,commit:2") || len(h.open) != 0 {
+		t.Errorf("tx = %v open = %v", h.tx[:4], h.open)
 	}
-	if strings.Join(h.tx, ",") != "begin:1,commit:1,begin:2,commit:2" {
-		t.Errorf("tx = %v", h.tx)
+	if h.kv["orders:last_customer"] != "300" {
+		t.Errorf("kv = %v", h.kv)
 	}
-	if len(h.results) != 0 {
-		t.Errorf("result sets not freed: %v", h.results)
-	}
-	if len(h.logs) == 0 || !strings.HasPrefix(h.logs[0], "2:record_order: customer 7") {
-		t.Errorf("logs = %v", h.logs)
+	if len(h.logs) == 0 || !strings.HasPrefix(h.logs[0], "2:record_order: customer 1 ") {
+		t.Errorf("logs = %v", h.logs[:1])
 	}
 
-	h.denySQL = true
+	h.failExec = true
 	if rc := api.DecodeI32(call(t, ctx, m, "record_order", api.EncodeI64(9), api.EncodeI64(1))); rc != -1 {
-		t.Errorf("record_order with denied exec_sql = %d, want -1", rc)
+		t.Errorf("record_order with failing execute = %d, want -1", rc)
 	}
-	if h.tx[len(h.tx)-1] != "rollback:3" {
-		t.Errorf("expected rollback, tx = %v", h.tx)
+	if last := h.tx[len(h.tx)-1]; last != "rollback:301" {
+		t.Errorf("expected rollback:301, got %s", last)
+	}
+	if last := h.logs[len(h.logs)-1]; !strings.Contains(last, "heliosdb_execute failed (host returned -2)") {
+		t.Errorf("error log = %q", last)
 	}
 }
 
-func TestExampleWASIReactor(t *testing.T) {
-	run(t, build(t, "-target=wasip1", "-buildmode=c-shared"))
-}
-
+// TestExampleWASMUnknown is the supported build: env imports only.
 func TestExampleWASMUnknown(t *testing.T) {
-	run(t, build(t, "-target=wasm-unknown"))
+	run(t, build(t, "-target=wasm-unknown", "-gc=conservative"))
+}
+
+// TestWASIModuleIsRejected documents why wasip1 builds are not supported:
+// they import wasi_snapshot_preview1, which the HeliosDB host does not link.
+func TestWASIModuleIsRejected(t *testing.T) {
+	ctx := context.Background()
+	r := wazero.NewRuntime(ctx)
+	defer r.Close(ctx)
+	if err := newFakeHost().instantiate(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	bin := build(t, "-target=wasip1", "-buildmode=c-shared")
+	_, err := r.Instantiate(ctx, bin)
+	if err == nil || !strings.Contains(fmt.Sprint(err), "wasi_snapshot_preview1") {
+		t.Fatalf("wasip1 module instantiated without WASI: %v", err)
+	}
 }

@@ -22,6 +22,7 @@ func TestApplyDiscount(t *testing.T) {
 
 func TestRecordOrder(t *testing.T) {
 	fake := heliosdbtest.Install(t)
+	fake.OnSQL("INSERT INTO orders", 1)
 	if rc := recordOrder(7, 1999); rc != 0 {
 		t.Fatalf("rc = %d", rc)
 	}
@@ -31,11 +32,11 @@ func TestRecordOrder(t *testing.T) {
 	if len(fake.SQL) != 2 || !strings.Contains(fake.SQL[0], "VALUES (7, 1999)") {
 		t.Fatalf("sql = %v", fake.SQL)
 	}
-	if got := ordersRecorded(); got != 2 {
-		t.Fatalf("orders_recorded = %d", got)
+	if string(fake.KV["orders:last_customer"]) != "8" {
+		t.Fatalf("kv = %q", fake.KV)
 	}
-	if fake.OpenResults() != 0 {
-		t.Fatal("result sets leaked")
+	if fake.OpenTx() != 0 {
+		t.Fatal("transaction left open")
 	}
 }
 
@@ -50,5 +51,16 @@ func TestRecordOrderRollsBackOnFailure(t *testing.T) {
 	}
 	if recordOrder(1, 0) != -1 {
 		t.Fatal("non-positive amount should fail")
+	}
+}
+
+func TestRecordOrderRejectsUnexpectedRowCount(t *testing.T) {
+	fake := heliosdbtest.Install(t)
+	fake.OnSQL("INSERT", 0)
+	if rc := recordOrder(7, 100); rc != -1 {
+		t.Fatalf("rc = %d", rc)
+	}
+	if fake.Tx[len(fake.Tx)-1].Op != "rollback" {
+		t.Fatalf("tx = %v", fake.Tx)
 	}
 }

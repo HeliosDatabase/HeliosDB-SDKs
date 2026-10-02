@@ -1,6 +1,6 @@
 # HeliosDB Go WASM procedure SDK
 
-Write HeliosDB Full stored procedures in Go, compile them to WebAssembly with
+Write HeliosDB Full WASM procedures in Go, compile them to WebAssembly with
 [TinyGo](https://tinygo.org), and test them natively with `go test`.
 
 ```bash
@@ -10,12 +10,27 @@ go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm@latest
 The module lives in `sdks/go/wasm` of
 [HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) and is
 versioned with tags of the form `sdks/go/wasm/vX.Y.Z`. It has no
-dependencies.
+dependencies. v0.1.0 is retracted: it targeted a host module that HeliosDB
+Full does not link, so its modules cannot be instantiated.
 
 | Package | Purpose |
 |---------|---------|
-| `github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm/heliosdb` | Host functions: SQL, transactions, key-value store, logging, hashing, random bytes |
+| `github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm/heliosdb` | Host functions: SQL statements, transactions, key-value writes, logging |
 | `github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm/heliosdbtest` | In-memory fake host for unit tests |
+
+## Status in HeliosDB Full
+
+The SDK builds modules for the WASM host in HeliosDB Full's `heliosdb-wasm`
+crate (`HostFunctions` in `heliosdb-wasm/src/host.rs`). That host registers
+its functions in the `env` import module, and Full's own Rust procedure
+runtime (`heliosdb-wasm/crates/runtime`) uses the same module.
+
+The `heliosdb-full` server does not run WASM procedures yet. "WASM
+functions" are on the server's list of subsystems that are not wired, so
+SQL that would create or call one is refused with SQLSTATE `0A000`. Modules
+you build now can be unit-tested with `heliosdbtest` and checked with the
+conformance suite below. They will load once the server enables the WASM
+host.
 
 ## Write a procedure
 
@@ -36,8 +51,9 @@ func applyDiscount(priceCents int64, percent int32) int64 {
 //export record_order
 func recordOrder(customerID, amountCents int64) int32 {
 	err := heliosdb.WithTx(func(heliosdb.Tx) error {
-		return heliosdb.Exec("INSERT INTO orders (customer_id, amount_cents) VALUES (" +
+		_, err := heliosdb.Exec("INSERT INTO orders (customer_id, amount_cents) VALUES (" +
 			heliosdb.Int64(customerID) + ", " + heliosdb.Int64(amountCents) + ")")
+		return err
 	})
 	if err != nil {
 		heliosdb.LogError("record_order: " + err.Error())
@@ -54,55 +70,56 @@ A complete example with tests is in [`examples/orders`](examples/orders).
 ## Build
 
 ```bash
-tinygo build -target=wasip1 -buildmode=c-shared -opt=z -no-debug -o orders.wasm .
+tinygo build -target=wasm-unknown -gc=conservative -opt=z -no-debug -o orders.wasm .
 ```
 
-The `wasm-unknown` target (`tinygo build -target=wasm-unknown ...`) also works
-and produces a smaller module without WASI imports, but it uses a leaking
-garbage collector, so prefer `wasip1` for procedures that allocate.
+The host has these requirements:
 
-Rules that follow from how the server runs procedures:
-
-- **Use TinyGo and `//export`.** The server instantiates the module and calls
+- **No WASI.** The host linker provides only the `env` functions, so a module
+  that imports `wasi_snapshot_preview1` (any `-target=wasip1` build, or the
+  standard Go toolchain's `GOOS=wasip1`) fails to instantiate. Use
+  `-target=wasm-unknown`. Add `-gc=conservative`, because that target
+  otherwise uses a garbage collector that never frees memory.
+- **Use TinyGo and `//export`.** The host instantiates the module and calls
   the exported function directly. It does not run `_start` or `_initialize`.
-  Modules built with the standard Go toolchain (`GOOS=wasip1`,
-  `//go:wasmexport`) and TinyGo's `//go:wasmexport` trap with "runtime not
-  initialized" when called that way.
 - **Keep package-level state static.** Values TinyGo can compute at compile
   time (constants, literals, maps of literals) are fine. Avoid `init()`
   functions with side effects.
-- **Scalars in, scalars out.** Return a status code or a number; write
+- **Scalars in, scalars out.** Return a status code or a number, and write
   richer results to a table with `Exec`.
 
 ## Host functions
 
-The `heliosdb` package wraps the `heliosdb` WASM import module. Imports are
-only linked into the module for the functions a procedure actually uses.
+The `heliosdb` package wraps these `env` imports. A function is only
+imported into the module if the procedure uses it.
 
 | Go API | Host import | Notes |
 |--------|-------------|-------|
-| `ExecSQL(sql) (Result, error)`, `Exec(sql) error`, `QueryRowCount(sql)` | `exec_sql(ptr, len i32) i32` | The host returns a result-set handle. There are no bind parameters: build literals with `Quote`, `QuoteIdent` and `Int64`. |
-| `Result.RowCount()`, `Result.Free()` | `result_row_count(id i32) i32`, `result_free(id i32)` | Row values are not readable through the ABI, only the row count. |
-| `ExecPrepared(stmtID)` | `exec_prepared(id i64) i32` | Statement prepared on the server. |
-| `Begin()`, `Tx.Commit()`, `Tx.Rollback()`, `WithTx(fn)` | `begin_transaction() i64`, `commit_transaction(id i64) i32`, `rollback_transaction(id i64) i32` | |
-| `KVGet`, `KVSet`, `KVDelete` | `kv_get(kp, kl, vp i32) i32`, `kv_set(kp, kl, vp, vl i32) i32`, `kv_delete(kp, kl i32) i32` | Values are 1 to 64 KiB (`MaxKVValueSize`). |
-| `Log`, `LogInfo`, `LogWarn`, `LogError`, ... | `log(level, ptr, len i32) i32` | Levels 0 (trace) to 4 (error). |
-| `Hash(alg, data)` | `hash(alg, dp, dl, op i32) i32` | `SHA256`, `SHA512`, `BLAKE3`. |
-| `RandomBytes(n)` | `random_bytes(op, n i32) i32` | Server CSPRNG, at most 1 MiB per call. |
+| `Exec(sql) (rowsAffected int64, err error)` | `heliosdb_execute(ptr, len i32) i64` | Negative return codes: -1 invalid UTF-8, -2 execution failed, -3 memory error. There are no bind parameters, so build literals with `Quote`, `QuoteIdent` and `Int64`. |
+| `Begin()`, `Tx.Commit()`, `Tx.Rollback()`, `WithTx(fn)` | `heliosdb_begin_tx() i64`, `heliosdb_commit_tx(id i64) i32`, `heliosdb_rollback_tx(id i64) i32` | |
+| `StorageWrite(key, value)` | `heliosdb_storage_write(kp, kl, vp, vl i32) i32` | The key must be valid UTF-8. |
+| `Log`, `LogInfo`, `LogWarn`, `LogError`, ... | `heliosdb_log(level, ptr, len i32) i32` | Levels range from 0 (trace) to 4 (error). |
 
-Every host call returns a negative value on failure, including when the
-procedure was not granted the capability it needs (database read/write,
-transactions, logging, crypto, random). The SDK turns that into a
-`*heliosdb.HostError`.
+A failed host call becomes a `*heliosdb.HostError` that carries the host's
+return code.
+
+**Not wrapped:** `heliosdb_query`, `heliosdb_storage_read` and
+`heliosdb_fetch_rows`. The host writes their results to a guest address it
+picks itself, using a bump allocator that starts at 64 KiB, rather than into
+a buffer the procedure supplies. TinyGo places a module's data segment at
+exactly 64 KiB, so these calls would overwrite the procedure's own globals.
+Read data inside SQL instead, for example with `INSERT ... SELECT` or
+`UPDATE ... FROM`.
 
 ## Test natively
 
 Outside WebAssembly the package uses a `Host` installed with `SetHost`. The
-`heliosdbtest` package provides one:
+`heliosdbtest` package provides one with the host's return codes:
 
 ```go
 func TestRecordOrder(t *testing.T) {
 	fake := heliosdbtest.Install(t)
+	fake.OnSQL("INSERT INTO orders", 1)
 	if rc := recordOrder(7, 1999); rc != 0 {
 		t.Fatalf("rc = %d", rc)
 	}
@@ -118,20 +135,15 @@ go test ./...
 
 ## ABI conformance
 
-[`conformance`](conformance) is a separate module that builds the example
-with TinyGo, checks every import against the host ABI (WASI preview 1 plus
-the `heliosdb` functions above, with exact signatures), and runs the
-procedures in [wazero](https://wazero.io) without calling `_start` or
-`_initialize`, the same way the server calls them.
+[`conformance`](conformance) is a separate module. It builds the example with
+TinyGo and checks every import against the `env` functions the host
+registers, with exact signatures. It confirms there are no WASI imports, runs
+the procedures in [wazero](https://wazero.io) without calling `_start` or
+`_initialize`, and checks that a `wasip1` build is rejected.
 
 ```bash
 cd conformance && go test ./...   # needs tinygo on PATH (or TINYGO=...)
 ```
-
-## Register the procedure
-
-Upload the `.wasm` module and register it as described in the
-[WASM procedures guide](https://heliosdb.com/docs/full/guides/features/wasm_procedures_user_guide/).
 
 ## License
 

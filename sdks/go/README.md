@@ -1,11 +1,14 @@
 # HeliosDB Go client
 
 Go client for the HeliosDB REST API (`/v1/...`): SQL queries, branches,
-vector search, agent memory and time-travel queries. It works with every
-HeliosDB edition that exposes the REST API (Nano, Lite, Full).
+vector search, agent memory and time-travel queries. It works with HeliosDB
+Nano and HeliosDB Lite, which serve these `/v1/...` endpoints.
 
-For plain SQL over the PostgreSQL wire protocol you can also use any standard
-Go PostgreSQL driver, such as [pgx](https://github.com/jackc/pgx).
+It does **not** work with HeliosDB Full. Full's HTTP API is served under
+`/api/v1/...` and has no branch endpoints, so every call from this client
+returns 404. For Full, use a standard Go PostgreSQL driver such as
+[pgx](https://github.com/jackc/pgx) over the PostgreSQL wire protocol (port
+5432 by default). You can do the same with Nano and Lite for plain SQL.
 
 To write HeliosDB Full stored procedures in Go (compiled to WebAssembly), see
 the separate module in [`wasm/`](wasm/).

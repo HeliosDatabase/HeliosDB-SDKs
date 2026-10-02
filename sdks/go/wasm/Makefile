@@ -6,7 +6,7 @@ test:
 	go test ./...
 
 example:
-	cd examples/orders && $(TINYGO) build -target=wasip1 -buildmode=c-shared -opt=z -no-debug -o orders.wasm .
+	cd examples/orders && $(TINYGO) build -target=wasm-unknown -gc=conservative -opt=z -no-debug -o orders.wasm .
 
 conformance:
 	cd conformance && TINYGO=$(TINYGO) go test ./...

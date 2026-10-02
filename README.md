@@ -8,8 +8,8 @@ All SDKs and integrations connect via the **HeliosDB REST API** (`/v1/...`), whi
 
 | Language | Path | Features |
 |----------|------|----------|
-| **Go** | [`sdks/go/`](sdks/go/) | Branches, vector search, agent memory, time-travel — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go@latest` |
-| **Go (WASM procedures)** | [`sdks/go/wasm/`](sdks/go/wasm/) | Write HeliosDB Full stored procedures in Go, compile with TinyGo — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm@latest` |
+| **Go** | [`sdks/go/`](sdks/go/) | REST client for Nano and Lite (branches, vector search, agent memory, time-travel); not Full — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go@latest` |
+| **Go (WASM procedures)** | [`sdks/go/wasm/`](sdks/go/wasm/) | Write HeliosDB Full WASM procedures in Go, compile with TinyGo (the Full server does not run WASM procedures yet) — `go get github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm@latest` |
 | **Python** | [`sdks/python/`](sdks/python/) | Full-featured: vectors, agents, branches, LangChain + LlamaIndex integrations |
 | **Python (SQLite compat)** | [`sdks/python-sqlite/`](sdks/python-sqlite/) | DB-API 2.0 drop-in replacement for `sqlite3` module |
 | **Rust** | [`sdks/rust/`](sdks/rust/) | HTTP client for remote HeliosDB servers (for embedded use, use `heliosdb-nano` crate directly) |

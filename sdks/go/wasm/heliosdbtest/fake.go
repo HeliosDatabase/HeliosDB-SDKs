@@ -13,16 +13,14 @@
 package heliosdbtest
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/sha512"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/HeliosDatabase/HeliosDB-SDKs/sdks/go/wasm/heliosdb"
 )
 
-// LogEntry is one call to the host log function.
+// LogEntry is one call to heliosdb_log.
 type LogEntry struct {
 	Level   heliosdb.LogLevel
 	Message string
@@ -36,42 +34,39 @@ type TxEvent struct {
 
 type sqlRule struct {
 	prefix string
-	rows   int
+	rows   int64
 	fail   bool
 }
 
-// Host is an in-memory heliosdb.Host. The zero value is not usable; call New.
+// Host is an in-memory heliosdb.Host that follows the return codes of the
+// HeliosDB Full host. The zero value is not usable; call New.
 type Host struct {
 	mu sync.Mutex
 
-	// SQL lists every statement passed to exec_sql, in order.
+	// SQL lists every statement passed to heliosdb_execute, in order.
 	SQL []string
 	// Logs lists every log call.
 	Logs []LogEntry
 	// Tx lists transaction calls.
 	Tx []TxEvent
-	// KV is the key-value store.
+	// KV holds values written with heliosdb_storage_write.
 	KV map[string][]byte
-	// Denied makes every call of the named host function fail with -1
-	// (e.g. "exec_sql"), simulating a missing capability.
+	// Denied makes every call of the named host function fail
+	// (e.g. "heliosdb_execute").
 	Denied map[string]bool
 
-	rules   []sqlRule
-	results map[int32]int
-	nextRes int32
-	nextTx  int64
-	freed   map[int32]bool
+	rules  []sqlRule
+	nextTx int64
+	open   map[int64]bool
 }
 
 // New returns an empty fake host.
 func New() *Host {
 	return &Host{
-		KV:      map[string][]byte{},
-		Denied:  map[string]bool{},
-		results: map[int32]int{},
-		freed:   map[int32]bool{},
-		nextRes: 1,
-		nextTx:  1,
+		KV:     map[string][]byte{},
+		Denied: map[string]bool{},
+		nextTx: 1,
+		open:   map[int64]bool{},
 	}
 }
 
@@ -89,17 +84,18 @@ func Install(t TB) *Host {
 	return h
 }
 
-// OnSQL makes statements starting with prefix (case-insensitive) return a
-// result set of rows rows. The first matching rule wins; unmatched
-// statements return an empty result set.
-func (h *Host) OnSQL(prefix string, rows int) *Host {
+// OnSQL makes statements starting with prefix (case-insensitive) report
+// rows rows affected. The first matching rule wins; unmatched statements
+// report 0 rows.
+func (h *Host) OnSQL(prefix string, rows int64) *Host {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rules = append(h.rules, sqlRule{prefix: strings.ToUpper(prefix), rows: rows})
 	return h
 }
 
-// FailSQL makes statements starting with prefix fail.
+// FailSQL makes statements starting with prefix fail with -2 (execution
+// failed).
 func (h *Host) FailSQL(prefix string) *Host {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -107,172 +103,100 @@ func (h *Host) FailSQL(prefix string) *Host {
 	return h
 }
 
-// Freed reports whether result set id was freed.
-func (h *Host) Freed(id int32) bool {
+// OpenTx returns the number of transactions neither committed nor rolled
+// back.
+func (h *Host) OpenTx() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.freed[id]
+	return len(h.open)
 }
 
-// OpenResults returns the number of result sets not yet freed.
-func (h *Host) OpenResults() int {
+func (h *Host) Execute(sql string) int64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return len(h.results)
-}
-
-func (h *Host) ExecSQL(sql string) int32 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.Denied["exec_sql"] {
+	if !utf8.ValidString(sql) {
 		return -1
 	}
+	if h.Denied["heliosdb_execute"] {
+		return -2
+	}
 	h.SQL = append(h.SQL, sql)
-	rows := 0
 	up := strings.ToUpper(strings.TrimSpace(sql))
 	for _, r := range h.rules {
 		if strings.HasPrefix(up, r.prefix) {
 			if r.fail {
-				return -1
+				return -2
 			}
-			rows = r.rows
-			break
+			return r.rows
 		}
 	}
-	id := h.nextRes
-	h.nextRes++
-	h.results[id] = rows
-	return id
+	return 0
 }
 
-func (h *Host) ExecPrepared(stmtID int64) int32 {
-	return h.ExecSQL("/* prepared */ EXECUTE " + heliosdb.Int64(stmtID))
-}
-
-func (h *Host) BeginTransaction() int64 {
+func (h *Host) BeginTx() int64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.Denied["begin_transaction"] {
+	if h.Denied["heliosdb_begin_tx"] {
 		return -1
 	}
 	id := h.nextTx
 	h.nextTx++
+	h.open[id] = true
 	h.Tx = append(h.Tx, TxEvent{Op: "begin", ID: id})
 	return id
 }
 
-func (h *Host) CommitTransaction(txID int64) int32 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.Denied["commit_transaction"] {
-		return -1
+func (h *Host) finish(op string, txID int64) int32 {
+	if txID <= 0 || txID >= h.nextTx {
+		return 1
 	}
-	h.Tx = append(h.Tx, TxEvent{Op: "commit", ID: txID})
+	if !h.open[txID] {
+		return 2
+	}
+	delete(h.open, txID)
+	h.Tx = append(h.Tx, TxEvent{Op: op, ID: txID})
 	return 0
 }
 
-func (h *Host) RollbackTransaction(txID int64) int32 {
+func (h *Host) CommitTx(txID int64) int32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.Denied["rollback_transaction"] {
-		return -1
+	if h.Denied["heliosdb_commit_tx"] {
+		return 3
 	}
-	h.Tx = append(h.Tx, TxEvent{Op: "rollback", ID: txID})
-	return 0
+	return h.finish("commit", txID)
 }
 
-func (h *Host) KVGet(key, dst []byte) int32 {
+func (h *Host) RollbackTx(txID int64) int32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.Denied["kv_get"] {
-		return -1
-	}
-	v, ok := h.KV[string(key)]
-	if !ok {
-		return 0
-	}
-	if len(v) > len(dst) {
-		// The real host would write past the buffer; fail loudly instead.
-		return -1
-	}
-	return int32(copy(dst, v))
+	return h.finish("rollback", txID)
 }
 
-func (h *Host) KVSet(key, value []byte) int32 {
+func (h *Host) StorageWrite(key string, value []byte) int32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.Denied["kv_set"] {
-		return -1
+	if !utf8.ValidString(key) {
+		return 1
 	}
-	h.KV[string(key)] = append([]byte(nil), value...)
-	return 0
-}
-
-func (h *Host) KVDelete(key []byte) int32 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.Denied["kv_delete"] {
-		return -1
+	if h.Denied["heliosdb_storage_write"] {
+		return 2
 	}
-	delete(h.KV, string(key))
+	h.KV[key] = append([]byte(nil), value...)
 	return 0
 }
 
 func (h *Host) Log(level heliosdb.LogLevel, msg string) int32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.Denied["log"] || level < heliosdb.LevelTrace || level > heliosdb.LevelError {
-		return -1
+	if level < heliosdb.LevelTrace || level > heliosdb.LevelError {
+		return 2
+	}
+	if !utf8.ValidString(msg) {
+		return 1
 	}
 	h.Logs = append(h.Logs, LogEntry{Level: level, Message: msg})
 	return 0
-}
-
-func (h *Host) Hash(alg heliosdb.HashAlgorithm, data, dst []byte) int32 {
-	if h.Denied["hash"] {
-		return -1
-	}
-	var sum []byte
-	switch alg {
-	case heliosdb.SHA256:
-		s := sha256.Sum256(data)
-		sum = s[:]
-	case heliosdb.SHA512:
-		s := sha512.Sum512(data)
-		sum = s[:]
-	default:
-		// BLAKE3 is not in the Go standard library; tests that need it
-		// should provide their own Host.
-		return -1
-	}
-	return int32(copy(dst, sum))
-}
-
-func (h *Host) RandomBytes(dst []byte) int32 {
-	if h.Denied["random_bytes"] || len(dst) > heliosdb.MaxRandomBytes {
-		return -1
-	}
-	if _, err := rand.Read(dst); err != nil {
-		return -1
-	}
-	return 0
-}
-
-func (h *Host) ResultRowCount(resultID int32) int32 {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	n, ok := h.results[resultID]
-	if !ok {
-		return -1
-	}
-	return int32(n)
-}
-
-func (h *Host) ResultFree(resultID int32) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.results, resultID)
-	h.freed[resultID] = true
 }
 
 var _ heliosdb.Host = (*Host)(nil)

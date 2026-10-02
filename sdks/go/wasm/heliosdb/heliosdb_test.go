@@ -1,8 +1,6 @@
 package heliosdb_test
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -13,51 +11,45 @@ import (
 func TestNoHost(t *testing.T) {
 	prev := heliosdb.SetHost(nil)
 	defer heliosdb.SetHost(prev)
-	if _, err := heliosdb.ExecSQL("SELECT 1"); !errors.Is(err, heliosdb.ErrNoHost) {
+	if _, err := heliosdb.Exec("SELECT 1"); !errors.Is(err, heliosdb.ErrNoHost) {
 		t.Fatalf("want ErrNoHost, got %v", err)
 	}
 }
 
-func TestExecSQLAndRowCount(t *testing.T) {
+func TestExecRowsAffected(t *testing.T) {
 	fake := heliosdbtest.Install(t)
-	fake.OnSQL("select", 3)
-	r, err := heliosdb.ExecSQL("SELECT * FROM t")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := r.RowCount()
+	fake.OnSQL("update", 3)
+	n, err := heliosdb.Exec("UPDATE t SET a = 1")
 	if err != nil || n != 3 {
-		t.Fatalf("rowcount = %d, %v", n, err)
+		t.Fatalf("Exec = %d, %v", n, err)
 	}
-	r.Free()
-	if !fake.Freed(r.ID()) || fake.OpenResults() != 0 {
-		t.Fatal("result not freed")
+	if n, err := heliosdb.Exec("CREATE TABLE x (a INT)"); n != 0 || err != nil {
+		t.Fatalf("Exec = %d, %v", n, err)
 	}
-	if n, err := heliosdb.QueryRowCount("select 1"); n != 3 || err != nil {
-		t.Fatalf("QueryRowCount = %d, %v", n, err)
-	}
-	if fake.OpenResults() != 0 {
-		t.Fatal("QueryRowCount leaked a result set")
+	if len(fake.SQL) != 2 {
+		t.Fatalf("sql = %v", fake.SQL)
 	}
 }
 
-func TestExecErrorAndDeniedCapability(t *testing.T) {
+func TestExecErrors(t *testing.T) {
 	fake := heliosdbtest.Install(t)
 	fake.FailSQL("DROP")
-	err := heliosdb.Exec("DROP TABLE x")
+	_, err := heliosdb.Exec("DROP TABLE x")
 	var he *heliosdb.HostError
-	if !errors.As(err, &he) || he.Op != "exec_sql" || he.Code != -1 {
-		t.Fatalf("want HostError exec_sql, got %v", err)
+	if !errors.As(err, &he) || he.Op != "heliosdb_execute" || he.Code != -2 {
+		t.Fatalf("want HostError heliosdb_execute -2, got %v", err)
 	}
-	fake.Denied["exec_sql"] = true
-	if err := heliosdb.Exec("SELECT 1"); err == nil {
-		t.Fatal("denied capability should fail")
+	if _, err := heliosdb.Exec("SELECT \xff"); !errors.As(err, &he) || he.Code != -1 {
+		t.Fatalf("invalid UTF-8: %v", err)
 	}
 }
 
 func TestWithTx(t *testing.T) {
 	fake := heliosdbtest.Install(t)
-	if err := heliosdb.WithTx(func(tx heliosdb.Tx) error { return heliosdb.Exec("INSERT INTO a VALUES (1)") }); err != nil {
+	if err := heliosdb.WithTx(func(tx heliosdb.Tx) error {
+		_, err := heliosdb.Exec("INSERT INTO a VALUES (1)")
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	boom := errors.New("boom")
@@ -73,58 +65,49 @@ func TestWithTx(t *testing.T) {
 			t.Fatalf("tx events %v", fake.Tx)
 		}
 	}
-}
-
-func TestKV(t *testing.T) {
-	heliosdbtest.Install(t)
-	if _, found, err := heliosdb.KVGet("k"); found || err != nil {
-		t.Fatalf("missing key: found=%v err=%v", found, err)
-	}
-	if err := heliosdb.KVSet("k", []byte("v1")); err != nil {
-		t.Fatal(err)
-	}
-	v, found, err := heliosdb.KVGet("k")
-	if err != nil || !found || string(v) != "v1" {
-		t.Fatalf("got %q %v %v", v, found, err)
-	}
-	if err := heliosdb.KVSet("k", nil); err != heliosdb.ErrEmptyValue {
-		t.Fatalf("empty value: %v", err)
-	}
-	if err := heliosdb.KVSet("k", make([]byte, heliosdb.MaxKVValueSize+1)); err != heliosdb.ErrValueTooLarge {
-		t.Fatalf("large value: %v", err)
-	}
-	if err := heliosdb.KVSet("big", make([]byte, heliosdb.MaxKVValueSize)); err != nil {
-		t.Fatal(err)
-	}
-	if v, _, _ := heliosdb.KVGet("big"); len(v) != heliosdb.MaxKVValueSize {
-		t.Fatalf("max-size value len %d", len(v))
-	}
-	if err := heliosdb.KVDelete("k"); err != nil {
-		t.Fatal(err)
-	}
-	if _, found, _ := heliosdb.KVGet("k"); found {
-		t.Fatal("deleted key still present")
+	if fake.OpenTx() != 0 {
+		t.Fatal("open transactions")
 	}
 }
 
-func TestLogHashRandom(t *testing.T) {
+func TestTxErrors(t *testing.T) {
 	fake := heliosdbtest.Install(t)
+	tx, err := heliosdb.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var he *heliosdb.HostError
+	if err := tx.Commit(); !errors.As(err, &he) || he.Code != 2 {
+		t.Fatalf("double commit: %v", err)
+	}
+	fake.Denied["heliosdb_begin_tx"] = true
+	if _, err := heliosdb.Begin(); !errors.As(err, &he) || he.Op != "heliosdb_begin_tx" {
+		t.Fatalf("denied begin: %v", err)
+	}
+}
+
+func TestStorageWriteAndLog(t *testing.T) {
+	fake := heliosdbtest.Install(t)
+	if err := heliosdb.StorageWrite("k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if string(fake.KV["k"]) != "v1" {
+		t.Fatalf("kv %q", fake.KV)
+	}
+	var he *heliosdb.HostError
+	if err := heliosdb.StorageWrite("\xff", nil); !errors.As(err, &he) || he.Code != 1 {
+		t.Fatalf("invalid key: %v", err)
+	}
 	heliosdb.LogInfo("hello")
 	heliosdb.LogError("bad")
 	if len(fake.Logs) != 2 || fake.Logs[0].Level != heliosdb.LevelInfo || fake.Logs[1].Message != "bad" {
 		t.Fatalf("logs %v", fake.Logs)
 	}
-	sum, err := heliosdb.Hash(heliosdb.SHA256, []byte("abc"))
-	want := sha256.Sum256([]byte("abc"))
-	if err != nil || !bytes.Equal(sum, want[:]) {
-		t.Fatalf("hash %x %v", sum, err)
-	}
-	b, err := heliosdb.RandomBytes(16)
-	if err != nil || len(b) != 16 {
-		t.Fatalf("random %v %v", b, err)
-	}
-	if _, err := heliosdb.RandomBytes(heliosdb.MaxRandomBytes + 1); err == nil {
-		t.Fatal("expected range error")
+	if err := heliosdb.Log(heliosdb.LogLevel(9), "x"); !errors.As(err, &he) || he.Code != 2 {
+		t.Fatalf("bad level: %v", err)
 	}
 }
 
