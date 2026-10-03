@@ -14,7 +14,7 @@
 - **Time-Travel Queries** - Access historical data with `AS OF TIMESTAMP`
 - **Database Branching** - Git-like workflows for schema changes
 - **PostgreSQL Types** - Extended type support (JSONB, UUID, VECTOR)
-- **Zero Python Dependencies** - Pure Python; talks to a local HeliosDB Nano executable
+- **Zero Python Dependencies** - Pure Python; talks to a local HeliosDB Nano executable (daemon mode, which connects to a running server, needs `psycopg2`)
 - **Cross-Platform** - Linux, macOS, Windows support
 
 ---
@@ -89,7 +89,8 @@ cursor.execute('INSERT INTO users VALUES (?, ?)', (1, 'Alice'))
 conn.commit()
 
 cursor.execute('SELECT * FROM users')
-print(cursor.fetchall())  # [(1, 'Alice')]
+print(cursor.fetchall())  # [('1', 'Alice')]: embedded mode returns text,
+                          # daemon mode [(1, 'Alice')]; see "Result types"
 
 conn.close()
 ```
@@ -256,6 +257,67 @@ The layer appends `RETURNING <pk>` to the `INSERT` and hides that result
 set. The primary-key column is looked up once per table and cached. To turn
 the rewrite off, use `connect(..., lastrowid=False)`.
 
+### Daemon mode (PostgreSQL wire protocol)
+
+`mode='daemon'` connects to a running HeliosDB Nano server over the
+PostgreSQL wire protocol instead of starting a local REPL. It needs
+`psycopg2`:
+
+```bash
+pip install "heliosdb-sqlite[daemon] @ git+https://github.com/HeliosDatabase/HeliosDB-SDKs.git#subdirectory=sdks/python-sqlite"
+```
+
+```python
+conn = heliosdb_sqlite.connect(
+    'app',                     # ignored in daemon mode
+    mode='daemon',
+    dsn='postgresql://helios@db.example.com:5432/heliosdb?sslmode=require',
+    server_password=os.environ['HELIOSDB_PASSWORD'],
+)
+```
+
+Connection settings: `dsn` (a libpq connection string or `postgresql://`
+URI), or `server_host` (default `127.0.0.1`), `server_port` (`5432`),
+`server_user` (`helios`), `server_database` (`heliosdb`); `server_password`.
+Keywords override the matching `dsn` fields. Without a password, libpq's
+`PGPASSWORD` and `~/.pgpass` apply.
+
+Each `Connection` keeps one server session, so `commit()` and `rollback()`
+act on the statements run before them, as in `sqlite3`.
+
+### Result types
+
+Values come back as the Python types `sqlite3` returns for the same data,
+decided by the column type the server reports (the type OID in the
+PostgreSQL RowDescription message), never by what the text looks like:
+
+| Server column type | Python value |
+|--------------------|--------------|
+| `SMALLINT`, `INTEGER`, `BIGINT` | `int` |
+| `REAL`, `DOUBLE PRECISION` | `float` |
+| `NUMERIC` / `DECIMAL` | `int` if integral and within 64 bits, else `float` (SQLite `NUMERIC` affinity) |
+| `BOOLEAN` | `int` `1` / `0` (SQLite has no boolean type) |
+| `BYTEA` | `bytes` |
+| `NULL` | `None` |
+| `TEXT`, `VARCHAR`, `CHAR`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, `VECTOR`, arrays, other types | `str`, as the server sent it |
+
+To get `datetime.date` and similar objects, register a converter and pass
+`detect_types`, as with `sqlite3`. With `PARSE_DECLTYPES` the converter is
+looked up by the column's server type (`DATE`, `TIMESTAMP`, `INTEGER`,
+`BOOLEAN`, `BYTEA`/`BLOB`, ...); with `PARSE_COLNAMES` by a `[type]` suffix in
+the column alias. Converters receive `bytes` and are never called for NULL.
+
+```python
+heliosdb_sqlite.register_converter('DATE', lambda b: datetime.date.fromisoformat(b.decode()))
+conn = heliosdb_sqlite.connect('app', mode='daemon', dsn=..., detect_types=heliosdb_sqlite.PARSE_DECLTYPES)
+```
+
+**Embedded mode returns text.** The embedded transport reads the table that
+`heliosdb-nano repl` prints, which carries no column types, so every value
+is a `str` (`NULL` becomes `None`; a text value spelled `NULL` does too).
+`PARSE_COLNAMES` converters still apply. Use daemon mode, or hybrid mode
+after `switch_to_server()`, when you need typed values.
+
 ### Exception Handling
 
 ```python
@@ -378,6 +440,10 @@ pip install -e ".[dev]"
 
 # Run tests
 pytest tests/ -v
+
+# Run the integration tests against a throwaway HeliosDB Nano server
+# (Linux Docker host; the server is removed afterwards)
+scripts/nano-integration-test.sh -v
 
 # Format code
 black heliosdb_sqlite/ tests/

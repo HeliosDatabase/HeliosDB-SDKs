@@ -114,6 +114,10 @@ Open a connection to a HeliosDB database.
   - `data_dir` (str): Custom data directory path
   - `server_port` (int): Server port for daemon mode (default: 5432)
   - `server_host` (str): Server host for daemon mode (default: '127.0.0.1')
+  - `server_user` (str): User for daemon mode (default: 'helios')
+  - `server_password` (str): Password for daemon mode (default: none; libpq's `PGPASSWORD` / `~/.pgpass` apply)
+  - `server_database` (str): Database for daemon mode (default: 'heliosdb')
+  - `dsn` (str): libpq connection string or `postgresql://` URI for daemon mode; the `server_*` keywords override its fields
 
 **Returns:**
 - `Connection`: Database connection object
@@ -1058,6 +1062,30 @@ Construct timestamp from UNIX timestamp.
 | `datetime.time` | `TIME` | ISO format |
 | `datetime.datetime` | `TIMESTAMP` | ISO format |
 | `list[float]` | `VECTOR(n)` | HeliosDB extension |
+
+`bytes`, `bytearray` and `memoryview` parameters are sent as PostgreSQL hex
+`BYTEA` literals (`'\x...'::bytea`).
+
+### Result values
+
+In daemon mode, values are converted by the column type the server reports
+(the PostgreSQL RowDescription type OID) to what `sqlite3` returns:
+
+| Server column type | Python value |
+|--------------------|--------------|
+| `SMALLINT`, `INTEGER`, `BIGINT` | `int` |
+| `REAL`, `DOUBLE PRECISION` | `float` |
+| `NUMERIC` / `DECIMAL` | `int` if integral and within 64 bits, else `float` |
+| `BOOLEAN` | `int` (`1` / `0`) |
+| `BYTEA` | `bytes` |
+| `NULL` | `None` |
+| `TEXT`, `VARCHAR`, `DATE`, `TIMESTAMP`, `UUID`, `JSON`, other types | `str` |
+
+`detect_types=PARSE_DECLTYPES` applies converters registered for the
+column's server type (`DATE`, `TIMESTAMP`, `INTEGER`, ...);
+`PARSE_COLNAMES` applies the converter named in a `"alias [type]"` column
+alias. Embedded mode reads the untyped table printed by `heliosdb-nano repl`
+and returns every value as `str` (only `PARSE_COLNAMES` converters apply).
 
 ## Complete Usage Example
 

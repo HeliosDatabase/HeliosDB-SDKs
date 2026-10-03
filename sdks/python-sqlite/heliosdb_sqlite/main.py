@@ -29,6 +29,8 @@ from typing import Any, List, Dict, Optional, Tuple, Union, Callable, Iterator
 from datetime import date, time as datetime_time, datetime
 from pathlib import Path
 
+from . import _types
+
 # Version constants (mimics sqlite3)
 version = "3.0.1"
 version_info = (3, 0, 1)
@@ -104,6 +106,18 @@ class DataError(DatabaseError):
 class NotSupportedError(DatabaseError):
     """Exception raised for unsupported operations."""
     pass
+
+
+# DB-API exception class names (as used by psycopg2) -> this module's classes
+_DRIVER_ERRORS = {
+    'IntegrityError': IntegrityError,
+    'ProgrammingError': ProgrammingError,
+    'OperationalError': OperationalError,
+    'DataError': DataError,
+    'NotSupportedError': NotSupportedError,
+    'InternalError': InternalError,
+    'InterfaceError': InterfaceError,
+}
 
 
 # ============================================================================
@@ -413,15 +427,20 @@ class Cursor:
 
             # Parse results
             if isinstance(results, dict):
-                # Query result
-                self._results = results.get('rows', [])
+                # Query result. 'types' holds the column type OIDs from the
+                # server's RowDescription when the transport has them (the
+                # PostgreSQL wire path); values are converted from those, as
+                # sqlite3 would return them.
+                columns = results.get('columns', [])
+                self._results = self._convert_rows(
+                    results.get('rows', []), columns, results.get('types')
+                )
                 self._result_index = 0
 
                 # Set description (column metadata)
-                columns = results.get('columns', [])
                 if columns:
                     self.description = [
-                        (col, None, None, None, None, None, None)
+                        (self._column_name(col), None, None, None, None, None, None)
                         for col in columns
                     ]
                 else:
@@ -583,6 +602,80 @@ class Cursor:
             raise StopIteration
         return row
 
+    def _column_name(self, name: str) -> str:
+        """Column name for cursor.description. With PARSE_COLNAMES, sqlite3
+        drops a trailing ``[type]`` (and the space before it)."""
+        if (self.connection.detect_types or 0) & PARSE_COLNAMES and isinstance(name, str):
+            pos = name.find('[')
+            if pos >= 0:
+                if pos > 0 and name[pos - 1] == ' ':
+                    pos -= 1
+                return name[:pos]
+        return name
+
+    def _lookup_converter(self, name: Any, type_oid: Optional[int]) -> Optional[Callable]:
+        """Converter registered with register_converter() for a column, the
+        way sqlite3 picks one: a ``[type]`` in the column name first
+        (PARSE_COLNAMES), then the column's type (PARSE_DECLTYPES), which
+        here comes from the server's type OID."""
+        detect = self.connection.detect_types or 0
+        if detect & PARSE_COLNAMES and isinstance(name, str):
+            start = name.find('[')
+            end = name.find(']', start + 1) if start >= 0 else -1
+            if end > start:
+                converter = _converters.get(name[start + 1:end].upper())
+                if converter is not None:
+                    return converter
+        if detect & PARSE_DECLTYPES and type_oid is not None:
+            for type_name in _types.TYPE_NAMES.get(type_oid, ()):
+                converter = _converters.get(type_name)
+                if converter is not None:
+                    return converter
+        return None
+
+    def _convert_rows(
+        self,
+        rows: List[Any],
+        columns: List[str],
+        type_oids: Optional[List[Optional[int]]],
+    ) -> List[List[Any]]:
+        """Turn transport rows into sqlite3-typed rows.
+
+        With type OIDs, each value is converted by its column's type (see
+        ``_types``). Without them (the embedded REPL transport prints an
+        untyped text table), values are passed through unchanged. Converters
+        from register_converter() take precedence when detect_types asks for
+        them, and receive the value's bytes as in sqlite3.
+        """
+        ncols = max(len(columns), len(type_oids or ()))
+        oids: List[Optional[int]] = [
+            type_oids[i] if type_oids and i < len(type_oids) else None
+            for i in range(ncols)
+        ]
+        converters: List[Optional[Callable]] = [None] * ncols
+        if self.connection.detect_types and _converters:
+            converters = [
+                self._lookup_converter(columns[i] if i < len(columns) else None, oids[i])
+                for i in range(ncols)
+            ]
+        if not any(oids) and not any(converters):
+            return [list(row) for row in rows]
+
+        converted = []
+        for row in rows:
+            out = []
+            for i, value in enumerate(row):
+                oid = oids[i] if i < ncols else None
+                converter = converters[i] if i < ncols else None
+                if value is None:
+                    out.append(None)
+                elif converter is not None:
+                    out.append(converter(_types.converter_input(oid, value)))
+                else:
+                    out.append(_types.convert_value(oid, value))
+            converted.append(out)
+        return converted
+
     def _bind_parameters(self, sql: str, parameters: Union[Tuple, Dict]) -> str:
         """
         Bind parameters to SQL statement.
@@ -629,9 +722,10 @@ class Cursor:
             # Escape single quotes
             escaped = value.replace("'", "''")
             return f"'{escaped}'"
-        elif isinstance(value, bytes):
-            # Convert to hex string
-            return f"X'{value.hex()}'"
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            # PostgreSQL hex bytea literal. HeliosDB rejects SQLite's X'..'
+            # blob literal ("HexStringLiteral not yet supported").
+            return f"'\\x{bytes(value).hex()}'::bytea"
         elif isinstance(value, (date, datetime)):
             return f"'{value.isoformat()}'"
         else:
@@ -707,6 +801,23 @@ class Connection:
         self._data_dir = kwargs.get('data_dir', None)
         self._server_port = kwargs.get('server_port', 5432)
         self._server_host = kwargs.get('server_host', '127.0.0.1')
+
+        # Daemon mode (PostgreSQL wire protocol). `dsn` is a libpq connection
+        # string or postgresql:// URI; the server_* keywords override its
+        # fields. Without a password, libpq's PGPASSWORD / ~/.pgpass apply.
+        self._dsn: Optional[str] = kwargs.get('dsn')
+        self._server_user: str = kwargs.get('server_user', 'helios')
+        self._server_password: Optional[str] = kwargs.get('server_password')
+        self._server_database: str = kwargs.get('server_database', 'heliosdb')
+        self._server_explicit: Dict[str, Any] = {
+            key: kwargs[key]
+            for key in ('server_host', 'server_port', 'server_user',
+                        'server_password', 'server_database')
+            if key in kwargs
+        }
+        # One wire session per Connection, so BEGIN/COMMIT and the
+        # statements between them share a transaction.
+        self._pg_conn: Any = None
 
         # Initialize HeliosDB connection based on mode
         self._initialize_heliosdb()
@@ -798,11 +909,10 @@ class Connection:
         return output.decode('utf-8', errors='replace')
 
     def _init_daemon_mode(self) -> None:
-        """Initialize server daemon mode."""
-        # Check if server is already running
-        # If not, start it
-        # For now, assume server is running
+        """Initialize server daemon mode: open the wire session now, so bad
+        credentials or an unreachable server fail in connect()."""
         self._heliosdb_process = None
+        self._daemon_connection()
 
     def _init_hybrid_mode(self) -> None:
         """Initialize hybrid mode (embedded + optional server)."""
@@ -924,44 +1034,101 @@ class Connection:
                 raise
             raise DatabaseError(f"Failed to execute SQL: {e}")
 
-    def _execute_daemon(self, sql: str) -> Union[Dict, int]:
-        """Execute SQL through PostgreSQL protocol to daemon."""
+    def _daemon_connect_params(self) -> Tuple[str, Dict[str, Any]]:
+        """libpq connection string and keyword overrides for daemon mode."""
+        names = {
+            'server_host': 'host',
+            'server_port': 'port',
+            'server_user': 'user',
+            'server_password': 'password',
+            'server_database': 'dbname',
+        }
+        if self._dsn:
+            params = {names[k]: v for k, v in self._server_explicit.items()}
+        else:
+            params = {
+                'host': self._server_host,
+                'port': self._server_port,
+                'user': self._server_user,
+                'dbname': self._server_database,
+            }
+            if self._server_password is not None:
+                params['password'] = self._server_password
+        if not (self._dsn and 'connect_timeout' in self._dsn):
+            # libpq treats 0 as "wait forever"; never round a short timeout
+            # down to that.
+            params['connect_timeout'] = max(1, int(round(self.timeout)))
+        return self._dsn or '', params
+
+    def _daemon_connection(self) -> Any:
+        """The Connection's wire session, opened on first use.
+
+        libpq autocommit is on: this layer sends BEGIN / COMMIT / ROLLBACK
+        itself (see begin(), commit(), rollback()), exactly as in embedded
+        mode. Every type is read as the text the server sent, so values are
+        converted by the column type OIDs in one place (``_types``) instead
+        of by psycopg2's own Python types.
+        """
+        conn = self._pg_conn
+        if conn is not None:
+            if not conn.closed:
+                return conn
+            self._pg_conn = None
+            if self._in_transaction:
+                self._in_transaction = False
+                raise OperationalError(
+                    "Lost the connection to the HeliosDB server; "
+                    "the open transaction was rolled back"
+                )
+
         try:
-            # Use psycopg2 or similar to connect to HeliosDB server
             import psycopg2
+            import psycopg2.extensions
+        except ImportError:
+            raise InterfaceError(
+                "Daemon mode needs psycopg2: pip install 'heliosdb-sqlite[daemon]' "
+                "(or psycopg2-binary)"
+            ) from None
 
-            conn = psycopg2.connect(
-                host=self._server_host,
-                port=self._server_port,
-                database='heliosdb',
-                user='helios',
-                password='',
-                connect_timeout=int(self.timeout)
-            )
+        dsn, params = self._daemon_connect_params()
+        try:
+            conn = psycopg2.connect(dsn, **params)
+        except psycopg2.Error as e:
+            raise OperationalError(f"Cannot connect to the HeliosDB server: {e}") from None
+        conn.autocommit = True
+        text_types = psycopg2.extensions.new_type(
+            tuple(psycopg2.extensions.string_types.keys()),
+            'HELIOSDB_SQLITE_TEXT',
+            lambda value, cursor: value,
+        )
+        psycopg2.extensions.register_type(text_types, conn)
+        self._pg_conn = conn
+        return conn
 
-            cursor = conn.cursor()
-            cursor.execute(sql)
+    def _execute_daemon(self, sql: str) -> Union[Dict, int]:
+        """Execute SQL over the PostgreSQL wire protocol on the session."""
+        conn = self._daemon_connection()
+        import psycopg2
 
-            # Check if query or command
-            if cursor.description:
-                # Query - has results
-                rows = cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
-                cursor.close()
-                conn.close()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                if cursor.description is None:
+                    return cursor.rowcount
                 return {
-                    'rows': rows,
-                    'columns': columns
+                    'rows': [list(row) for row in cursor.fetchall()],
+                    'columns': [desc[0] for desc in cursor.description],
+                    # RowDescription type OIDs, one per column
+                    'types': [desc[1] for desc in cursor.description],
                 }
-            else:
-                # Command - return rowcount
-                rowcount = cursor.rowcount
-                cursor.close()
-                conn.close()
-                return rowcount
-
-        except Exception as e:
-            raise DatabaseError(f"Daemon execution failed: {e}")
+        except psycopg2.Error as e:
+            # psycopg2's classes follow the DB-API names; raise ours.
+            error_class: type = DatabaseError
+            for klass in type(e).__mro__:
+                if klass.__name__ in _DRIVER_ERRORS:
+                    error_class = _DRIVER_ERRORS[klass.__name__]
+                    break
+            raise error_class(str(e).strip()) from None
 
     def _parse_repl_output(self, output: str, sql: str) -> Union[Dict, int]:
         """
@@ -1135,8 +1302,23 @@ class Connection:
     def close(self) -> None:
         """Close the database connection."""
         if not self._closed:
-            if self._in_transaction:
-                self.rollback()
+            pg_conn = getattr(self, '_pg_conn', None)
+            try:
+                if self._in_transaction:
+                    if self._mode == 'daemon' and (pg_conn is None or pg_conn.closed):
+                        # No live session: the server already discarded
+                        # the transaction.
+                        self._in_transaction = False
+                    else:
+                        self.rollback()
+            finally:
+                pg_conn = getattr(self, '_pg_conn', None)
+                if pg_conn is not None:
+                    self._pg_conn = None
+                    try:
+                        pg_conn.close()
+                    except Exception:
+                        pass
 
             # Terminate persistent REPL process if running
             if hasattr(self, '_heliosdb_process') and self._heliosdb_process is not None:

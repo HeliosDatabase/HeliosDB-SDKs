@@ -115,15 +115,20 @@ Return {
 ```
 Connection._execute_daemon()
     ↓
-1. Connect via PostgreSQL protocol (psycopg2)
+1. Reuse the Connection's PostgreSQL session (psycopg2, opened once,
+   libpq autocommit on; BEGIN/COMMIT/ROLLBACK come from the Connection)
 2. Execute SQL through pg_wire protocol
-3. Fetch results from server
-4. Parse into structured format
+3. Fetch rows as the text the server sent, plus each column's type OID
+   from RowDescription
     ↓
 Return {
-    'rows': [[1, 'Alice'], [2, 'Bob']],
-    'columns': ['id', 'name']
+    'rows': [['1', 'Alice'], ['2', 'Bob']],
+    'columns': ['id', 'name'],
+    'types': [23, 25]          # int4, text
 }
+    ↓
+Cursor converts by type OID (heliosdb_sqlite/_types.py):
+[(1, 'Alice'), (2, 'Bob')]
 ```
 
 #### Hybrid Mode

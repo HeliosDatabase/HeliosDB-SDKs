@@ -265,6 +265,9 @@ if __name__ == "__main__":
             "async": [
                 "aiofiles>=23.0.0",
             ],
+            "daemon": [
+                "psycopg2-binary>=2.8",
+            ],
             "types": [
                 "types-setuptools>=65.0.0",
             ],

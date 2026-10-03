@@ -96,6 +96,11 @@ async = [
     "aiofiles>=23.0.0",
 ]
 
+# Daemon mode: connect to a running HeliosDB server (PostgreSQL wire protocol)
+daemon = [
+    "psycopg2-binary>=2.8",
+]
+
 # Type checking support
 types = [
     "types-setuptools>=65.0.0",
@@ -107,6 +112,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.1.0",
+    "psycopg2-binary>=2.8",
     "mypy>=1.0.0",
     "ruff>=0.1.0",
     "black>=23.0.0",

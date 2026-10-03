@@ -237,9 +237,14 @@ heliosdb start --port 5432 --daemon
 conn = sqlite3.connect(
     'app.db',
     mode='daemon',
-    server_port=5432
+    server_port=5432,
+    server_password='...',   # or dsn='postgresql://helios@host:5432/heliosdb'
 )
 ```
+
+Daemon mode needs `psycopg2` (`pip install psycopg2-binary`). It returns typed
+values (`int`, `float`, `bytes`, ...) from the server's column types; embedded
+mode returns text. See "Result types" in the README.
 
 **Pros:**
 - Persistent connection
