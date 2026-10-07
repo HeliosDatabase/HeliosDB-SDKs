@@ -2,18 +2,21 @@
 HELIOSDB_SQLITE_MAIN_LIBRARY.py
 
 Production-ready SQLite API compatibility layer for HeliosDB.
-Provides 100% API compatibility with Python's sqlite3 module while routing
-all operations to HeliosDB's embedded REPL mode.
+Provides the API of Python's sqlite3 module on top of HeliosDB Nano.
 
 Architecture:
 - Drop-in replacement: No application code changes required
-- Multi-mode support: REPL embedded, Server daemon, Hybrid
+- Embedded mode (default): the engine runs in-process through the
+  ``heliosdb-nano-embedded`` binding (typed values, native parameter binding);
+  without that wheel it falls back, with a warning, to driving the
+  ``heliosdb-nano repl`` subprocess (every value comes back as text)
+- Daemon mode: PostgreSQL wire protocol to a Nano server (typed by OID)
 - Advanced features: Vector search, branching, time-travel, encryption
 - Full transaction support: Autocommit, explicit transactions, savepoints
 - Complete API coverage: All sqlite3.Connection and sqlite3.Cursor methods
 
 Author: HeliosDB Team
-Version: 3.0.1
+Version: 3.1.0
 License: Apache-2.0
 """
 
@@ -25,15 +28,18 @@ import threading
 import time
 import tempfile
 import re
+import warnings
+from collections.abc import Mapping
+from decimal import Decimal
 from typing import Any, List, Dict, Optional, Tuple, Union, Callable, Iterator
 from datetime import date, time as datetime_time, datetime
 from pathlib import Path
 
-from . import _types
+from . import _embedded, _sql, _types
 
 # Version constants (mimics sqlite3)
-version = "3.0.1"
-version_info = (3, 0, 1)
+version = "3.1.0"
+version_info = (3, 1, 0)
 sqlite_version = "3.45.0 (HeliosDB compatible)"
 sqlite_version_info = (3, 45, 0)
 
@@ -217,51 +223,68 @@ def complete_statement(statement: str) -> bool:
     return stripped.endswith(';')
 
 
+def _convert_date(val: bytes) -> date:
+    return date(*map(int, val.split(b"-")))
+
+
+def _convert_timestamp(val: bytes) -> datetime:
+    datepart, timepart = val.split(b" ")
+    year, month, day = map(int, datepart.split(b"-"))
+    timepart_full = timepart.split(b".")
+    hours, minutes, seconds = map(int, timepart_full[0].split(b":"))
+    if len(timepart_full) == 2:
+        microseconds = int('{:0<6.6}'.format(timepart_full[1].decode()))
+    else:
+        microseconds = 0
+    return datetime(year, month, day, hours, minutes, seconds, microseconds)
+
+
+# The default converters CPython's sqlite3 registers (used only with
+# detect_types=PARSE_DECLTYPES / PARSE_COLNAMES).
+register_converter("date", _convert_date)
+register_converter("timestamp", _convert_timestamp)
+
+
 # ============================================================================
 # ROW CLASS - Factory for result rows
 # ============================================================================
 
 class Row:
     """
-    Represents a single row from a database query result.
-    Supports both index and name-based access.
+    A result row with access by index and by case-insensitive column name,
+    like sqlite3.Row.
     """
 
     def __init__(self, cursor: 'Cursor', values: Tuple[Any, ...]):
-        """
-        Initialize a Row object.
-
-        Args:
-            cursor: The cursor that produced this row
-            values: Tuple of column values
-        """
-        self._cursor = cursor
-        self._values = values
+        self._values = tuple(values)
         self._description = cursor.description or []
 
-    def __getitem__(self, key: Union[int, str]) -> Any:
-        """Get column value by index or name."""
-        if isinstance(key, int):
+    def __getitem__(self, key: Union[int, str, slice]) -> Any:
+        if isinstance(key, (int, slice)):
             return self._values[key]
-        elif isinstance(key, str):
-            # Find column by name
+        if isinstance(key, str):
+            folded = key.lower()
             for i, desc in enumerate(self._description):
-                if desc[0] == key:
+                if isinstance(desc[0], str) and desc[0].lower() == folded:
                     return self._values[i]
-            raise IndexError(f"No column named '{key}'")
-        else:
-            raise TypeError(f"Index must be int or str, not {type(key).__name__}")
+            raise IndexError("No item with that key")
+        raise TypeError(f"Index must be int or str, not {type(key).__name__}")
 
     def __len__(self) -> int:
-        """Return number of columns."""
         return len(self._values)
 
     def __iter__(self) -> Iterator[Any]:
-        """Iterate over column values."""
         return iter(self._values)
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Row):
+            return NotImplemented
+        return self.keys() == other.keys() and self._values == other._values
+
+    def __hash__(self) -> int:
+        return hash((tuple(self.keys()), self._values))
+
     def __repr__(self) -> str:
-        """String representation."""
         return f"<Row {self._values}>"
 
     def keys(self) -> List[str]:
@@ -379,144 +402,197 @@ class Cursor:
         body = sql.rstrip().rstrip(';')
         return f'{body} RETURNING "{pk_col}"', pk_col
 
+    # Statements whose result set is a query result: sqlite3 reports
+    # rowcount -1 for them.
+    _QUERY_KEYWORDS = frozenset(('SELECT', 'WITH', 'VALUES', 'PRAGMA', 'SHOW', 'EXPLAIN', 'TABLE'))
+    # Statements before which sqlite3 (isolation_level not None) opens a
+    # transaction implicitly.
+    _DML_KEYWORDS = frozenset(('INSERT', 'UPDATE', 'DELETE', 'REPLACE'))
+
     def execute(self, sql: str, parameters: Union[Tuple, Dict] = ()) -> 'Cursor':
         """
         Execute a single SQL statement.
 
         Args:
             sql: SQL statement to execute
-            parameters: Parameters for SQL (tuple or dict for named params)
+            parameters: Parameters for SQL (sequence for ``?``, mapping for
+                ``:name``)
 
         Returns:
             Self for chaining
 
         Raises:
-            ProgrammingError: If cursor is closed or SQL is invalid
-            DatabaseError: If execution fails
+            ProgrammingError: closed connection, wrong number of parameters
+            OperationalError / IntegrityError / DataError: the engine
+                rejected the statement
         """
-        if self.connection._closed:
-            raise ProgrammingError("Cannot operate on closed connection")
+        self._check_open()
+        self._trace(sql)
+        self._run(sql, parameters)
+        return self
 
-        # Trace callback
+    def _check_open(self) -> None:
+        if self.connection._closed:
+            raise ProgrammingError("Cannot operate on a closed database.")
+
+    @staticmethod
+    def _trace(sql: str) -> None:
         if _trace_callback:
             try:
                 _trace_callback(sql)
-            except Exception as e:
+            except Exception:
                 if _enable_callback_tracebacks_flag:
                     import traceback
                     traceback.print_exc()
 
-        # Bind parameters
-        bound_sql = self._bind_parameters(sql, parameters)
+    def _run(
+        self,
+        sql: str,
+        parameters: Any = (),
+        implicit_begin: bool = True,
+    ) -> None:
+        """Execute one statement and load its result into the cursor."""
+        conn = self.connection
+        if conn._sqlite_types:
+            sql = _sql.rewrite_ddl_types(sql)
+        keyword = _sql.first_keyword(sql)
+
+        # Bind parameters: natively ($1..$n) on the in-process binding, as
+        # SQL literals for the REPL and wire transports.
+        if conn._backend is not None:
+            stmt, values = self._bind_native(sql, parameters)
+        else:
+            stmt, values = self._bind_parameters(sql, parameters), None
 
         # sqlite3.Cursor.lastrowid: when the user runs an INSERT we
         # transparently append RETURNING <pk> so the engine hands the new
-        # row's PK back. Standard PostgreSQL feature — works in both
-        # embedded and daemon mode, no engine state needed. Per
-        # sqlite3 semantics, lastrowid is cleared on every INSERT and
-        # left untouched on non-INSERT statements; clearing once when we
-        # detect an INSERT (whether or not the rewrite applies) matches
-        # that contract for tables without an int PK.
-        if self._INSERT_RE.match(bound_sql):
+        # row's PK back. lastrowid is cleared on every INSERT and left
+        # untouched by other statements.
+        # sqlite3 opens a transaction implicitly before DML unless the
+        # connection is in autocommit mode (isolation_level=None).
+        if (implicit_begin and conn.isolation_level is not None
+                and not conn._in_transaction and keyword in self._DML_KEYWORDS):
+            conn.begin()
+
+        if self._INSERT_RE.match(stmt):
             self.lastrowid = None
-        bound_sql, lastrowid_pk = self._maybe_inject_returning(bound_sql)
+        stmt, lastrowid_pk = self._maybe_inject_returning(stmt)
 
-        # Execute through connection
         try:
-            results = self.connection._execute_sql(bound_sql)
+            if values is not None:
+                results = conn._execute_bound(stmt, values)
+            else:
+                results = conn._execute_sql(stmt)
+        except Error:
+            raise
+        except Exception as e:
+            raise DatabaseError(f"Error executing SQL: {e}") from None
 
-            # Parse results
-            if isinstance(results, dict):
-                # Query result. 'types' holds the column type OIDs from the
-                # server's RowDescription when the transport has them (the
-                # PostgreSQL wire path); values are converted from those, as
-                # sqlite3 would return them.
-                columns = results.get('columns', [])
-                self._results = self._convert_rows(
-                    results.get('rows', []), columns, results.get('types')
-                )
-                self._result_index = 0
+        conn._track_transaction(keyword, stmt)
 
-                # Set description (column metadata)
-                if columns:
-                    self.description = [
-                        (self._column_name(col), None, None, None, None, None, None)
-                        for col in columns
-                    ]
-                else:
-                    self.description = None
+        if isinstance(results, dict):
+            # Query result. 'types' holds the column type OIDs from the
+            # server's RowDescription (wire transport); 'decl_oids' marks a
+            # typed result from the in-process binding.
+            columns = results.get('columns', [])
+            self._results = self._convert_rows(
+                results.get('rows', []), columns, results.get('types'),
+                results.get('decl_oids'),
+            )
+            self._result_index = 0
+            self.description = [
+                (self._column_name(col), None, None, None, None, None, None)
+                for col in columns
+            ] if columns else None
+            self.rowcount = -1 if keyword in self._QUERY_KEYWORDS else len(self._results)
 
-                self.rowcount = len(self._results)
-
-                # If we injected RETURNING <pk>, capture the last row's
-                # value as cursor.lastrowid. Multi-row INSERTs follow
-                # sqlite3 semantics: lastrowid = the most recent insert.
-                if lastrowid_pk and self._results:
+            # If we injected RETURNING <pk>, capture the last row's value as
+            # cursor.lastrowid and hide the synthesised result set.
+            if lastrowid_pk:
+                inserted = len(self._results)
+                if self._results:
                     last_row = self._results[-1]
-                    pk_idx = 0
-                    if columns and lastrowid_pk in columns:
-                        pk_idx = columns.index(lastrowid_pk)
+                    pk_idx = columns.index(lastrowid_pk) if lastrowid_pk in columns else 0
                     if pk_idx < len(last_row):
                         try:
                             self.lastrowid = int(last_row[pk_idx])
                         except (TypeError, ValueError):
                             self.lastrowid = None
-                    # Hide the synthesised RETURNING from the caller —
-                    # they ran an INSERT, they expect rowcount/None
-                    # description, not query results. rowcount is the
-                    # number of inserted rows, as in sqlite3.
-                    inserted = len(self._results)
-                    self._results = []
-                    self._result_index = 0
-                    self.description = None
-                    self.rowcount = inserted
-            else:
-                # Command result (INSERT, UPDATE, DELETE, etc.)
                 self._results = []
                 self._result_index = 0
                 self.description = None
-                self.rowcount = results if isinstance(results, int) else -1
+                self.rowcount = inserted
+        else:
+            # Command result (INSERT, UPDATE, DELETE, DDL, ...)
+            self._results = []
+            self._result_index = 0
+            self.description = None
+            self.rowcount = results if isinstance(results, int) else -1
 
-            return self
-
-        except Exception as e:
-            raise DatabaseError(f"Error executing SQL: {e}")
-
-    def executemany(self, sql: str, seq_of_parameters: List[Union[Tuple, Dict]]) -> 'Cursor':
+    def executemany(self, sql: str, seq_of_parameters: Any) -> 'Cursor':
         """
-        Execute SQL statement for each parameter set.
+        Execute a DML statement once per parameter set.
 
-        Args:
-            sql: SQL statement to execute
-            seq_of_parameters: Sequence of parameter tuples/dicts
-
-        Returns:
-            Self for chaining
+        As in sqlite3: only DML is accepted, ``rowcount`` is the total
+        number of modified rows, and ``lastrowid`` is left unchanged.
         """
-        for parameters in seq_of_parameters:
-            self.execute(sql, parameters)
+        self._check_open()
+        conn = self.connection
+        if conn._sqlite_types:
+            sql = _sql.rewrite_ddl_types(sql)
+        keyword = _sql.first_keyword(sql)
+        if keyword in self._QUERY_KEYWORDS or _sql.has_keyword(sql, 'RETURNING'):
+            raise ProgrammingError("executemany() can only execute DML statements.")
+        self._trace(sql)
+        saved_lastrowid = self.lastrowid
+        total = 0
+        backend = conn._backend
+        if backend is not None and keyword in self._DML_KEYWORDS:
+            # One engine call for the whole batch.
+            stmt = None
+            batch = []
+            for parameters in seq_of_parameters:
+                stmt_i, values = self._bind_native(sql, parameters)
+                stmt = stmt_i
+                batch.append(values)
+            if batch:
+                if conn.isolation_level is not None and not conn._in_transaction:
+                    conn.begin()
+                total = conn._execute_bound_many(stmt, batch)
+        else:
+            disabled = conn._lastrowid_disabled
+            conn._lastrowid_disabled = True  # no RETURNING rewrite per row
+            try:
+                for parameters in seq_of_parameters:
+                    self._run(sql, parameters)
+                    if self.rowcount > 0:
+                        total += self.rowcount
+            finally:
+                conn._lastrowid_disabled = disabled
+        self._results = []
+        self._result_index = 0
+        self.description = None
+        self.rowcount = total
+        self.lastrowid = saved_lastrowid
         return self
 
     def executescript(self, sql_script: str) -> 'Cursor':
         """
-        Execute multiple SQL statements separated by semicolons.
+        Execute several SQL statements separated by semicolons.
 
-        Args:
-            sql_script: SQL script with multiple statements
-
-        Returns:
-            Self for chaining
+        As in sqlite3, a pending transaction is committed first and the
+        script then runs as written (no implicit transactions).
         """
-        # Auto-commit before script
-        if not self.connection._in_transaction:
-            self.connection.commit()
-
-        # Split by semicolons (basic parser)
-        statements = [s.strip() for s in sql_script.split(';') if s.strip()]
-
-        for statement in statements:
-            self.execute(statement + ';')
-
+        self._check_open()
+        conn = self.connection
+        if conn._in_transaction:
+            conn.commit()
+        for statement in _sql.split_statements(sql_script):
+            self._trace(statement)
+            self._run(statement, (), implicit_begin=False)
+        self._results = []
+        self._result_index = 0
+        self.description = None
         return self
 
     def fetchone(self) -> Optional[Union[Tuple, Row]]:
@@ -638,18 +714,26 @@ class Cursor:
         rows: List[Any],
         columns: List[str],
         type_oids: Optional[List[Optional[int]]],
+        decl_oids: Optional[List[Optional[int]]] = None,
     ) -> List[List[Any]]:
         """Turn transport rows into sqlite3-typed rows.
 
-        With type OIDs, each value is converted by its column's type (see
-        ``_types``). Without them (the embedded REPL transport prints an
-        untyped text table), values are passed through unchanged. Converters
-        from register_converter() take precedence when detect_types asks for
-        them, and receive the value's bytes as in sqlite3.
+        * In-process binding (``decl_oids`` given): values are already the
+          Python types sqlite3 returns; ``decl_oids`` are the declared column
+          types, used only to pick PARSE_DECLTYPES converters.
+        * Wire transport (``type_oids`` given): each value is converted by
+          its column's type OID (see ``_types``).
+        * REPL transport (neither): values are passed through as text.
+
+        Converters from register_converter() take precedence when
+        detect_types asks for them, and receive the value's bytes as in
+        sqlite3. A text_factory other than ``str`` is applied to text values.
         """
-        ncols = max(len(columns), len(type_oids or ()))
+        typed = decl_oids is not None
+        ncols = max(len(columns), len(type_oids or ()), len(decl_oids or ()))
+        source = decl_oids if typed else type_oids
         oids: List[Optional[int]] = [
-            type_oids[i] if type_oids and i < len(type_oids) else None
+            source[i] if source and i < len(source) else None
             for i in range(ncols)
         ]
         converters: List[Optional[Callable]] = [None] * ncols
@@ -658,7 +742,13 @@ class Cursor:
                 self._lookup_converter(columns[i] if i < len(columns) else None, oids[i])
                 for i in range(ncols)
             ]
-        if not any(oids) and not any(converters):
+        text_factory = getattr(self.connection, 'text_factory', str)
+        if text_factory is str:
+            text_factory = None
+        if typed:
+            if not any(converters) and text_factory is None:
+                return [list(row) for row in rows]
+        elif not any(oids) and not any(converters):
             return [list(row) for row in rows]
 
         converted = []
@@ -670,54 +760,138 @@ class Cursor:
                 if value is None:
                     out.append(None)
                 elif converter is not None:
-                    out.append(converter(_types.converter_input(oid, value)))
+                    data = (_embedded.converter_input(value) if typed
+                            else _types.converter_input(oid, value))
+                    out.append(converter(data))
                 else:
-                    out.append(_types.convert_value(oid, value))
+                    if not typed:
+                        value = _types.convert_value(oid, value)
+                    if text_factory is not None and isinstance(value, str):
+                        value = text_factory(value.encode('utf-8'))
+                    out.append(value)
             converted.append(out)
         return converted
 
-    def _bind_parameters(self, sql: str, parameters: Union[Tuple, Dict]) -> str:
+    def _plan_bindings(self, sql: str, parameters: Any) -> Tuple[List[_sql.Placeholder], List[int], List[Any]]:
+        """Match ``parameters`` to the statement's placeholders the way
+        sqlite3 does. Returns (placeholders, 1-based value index for each
+        placeholder, values)."""
+        placeholders = _sql.find_placeholders(sql)
+        if parameters is None:
+            parameters = ()
+        is_map = isinstance(parameters, Mapping)
+        if not is_map and not isinstance(parameters, (list, tuple)):
+            try:
+                parameters = list(parameters)
+            except TypeError:
+                raise ProgrammingError("parameters are of unsupported type") from None
+        if not placeholders:
+            if not is_map and len(parameters):
+                raise ProgrammingError(
+                    "Incorrect number of bindings supplied. The current statement "
+                    f"uses 0, and there are {len(parameters)} supplied.")
+            return [], [], []
+
+        natives = [p for p in placeholders if p.kind == 'native']
+        if natives:
+            if len(natives) != len(placeholders):
+                raise ProgrammingError(
+                    "Cannot mix $1-style parameters with ?, :name, @name or $name")
+            if is_map:
+                raise ProgrammingError("$1-style parameters need a sequence, not a mapping")
+            needed = max(p.key for p in natives)
+            if needed != len(parameters):
+                raise ProgrammingError(
+                    "Incorrect number of bindings supplied. The current statement "
+                    f"uses {needed}, and there are {len(parameters)} supplied.")
+            return placeholders, [p.key for p in placeholders], list(parameters)
+
+        slots: List[int] = []
+        if is_map:
+            values: List[Any] = []
+            index_of: Dict[str, int] = {}
+            for n, p in enumerate(placeholders, 1):
+                if p.kind != 'named':
+                    raise ProgrammingError(
+                        f"Binding {n} has no name, but you supplied a dictionary "
+                        "(which has only names).")
+                if p.key not in index_of:
+                    if p.key not in parameters:
+                        raise ProgrammingError(
+                            f"You did not supply a value for binding parameter :{p.key}.")
+                    values.append(parameters[p.key])
+                    index_of[p.key] = len(values)
+                slots.append(index_of[p.key])
+            return placeholders, slots, values
+
+        largest = 0
+        named: Dict[str, int] = {}
+        for p in placeholders:
+            if p.kind == 'qmark':
+                largest += 1
+                idx = largest
+            elif p.kind == 'numbered':
+                idx = p.key
+                largest = max(largest, idx)
+            elif p.key in named:
+                idx = named[p.key]
+            else:
+                largest += 1
+                idx = named[p.key] = largest
+            slots.append(idx)
+        if largest != len(parameters):
+            raise ProgrammingError(
+                "Incorrect number of bindings supplied. The current statement "
+                f"uses {largest}, and there are {len(parameters)} supplied.")
+        return placeholders, slots, list(parameters)
+
+    @staticmethod
+    def _splice(sql: str, placeholders: List[_sql.Placeholder], texts: List[str]) -> str:
+        out = []
+        pos = 0
+        for p, text in zip(placeholders, texts):
+            out.append(sql[pos:p.start])
+            out.append(text)
+            pos = p.end
+        out.append(sql[pos:])
+        return ''.join(out)
+
+    def _bind_native(self, sql: str, parameters: Any) -> Tuple[str, List[Any]]:
+        """``?`` / ``:name`` placeholders -> ``$n``, with values adapted to
+        the types the binding accepts."""
+        placeholders, slots, values = self._plan_bindings(sql, parameters)
+        if not placeholders:
+            return sql, []
+        adapted = [_adapt_native(v, i) for i, v in enumerate(values, 1)]
+        if all(p.kind == 'native' for p in placeholders):
+            return sql, adapted
+        return self._splice(sql, placeholders, [f'${n}' for n in slots]), adapted
+
+    def _bind_parameters(self, sql: str, parameters: Any) -> str:
+        """Bind parameters as SQL literals (REPL and wire transports).
+
+        Supports ``?``, ``?NNN``, ``:name``, ``@name`` and ``$name``
+        placeholders; placeholders inside strings and comments are left
+        alone.
         """
-        Bind parameters to SQL statement.
-
-        Supports:
-        - Positional: ? placeholders
-        - Named: :name, @name, $name placeholders
-
-        Args:
-            sql: SQL with placeholders
-            parameters: Parameter values
-
-        Returns:
-            SQL with bound parameters
-        """
-        if not parameters:
+        placeholders, slots, values = self._plan_bindings(sql, parameters)
+        if not placeholders:
             return sql
-
-        if isinstance(parameters, dict):
-            # Named parameters
-            result = sql
-            for key, value in parameters.items():
-                placeholder_variants = [f':{key}', f'@{key}', f'${key}']
-                for placeholder in placeholder_variants:
-                    if placeholder in result:
-                        result = result.replace(placeholder, self._format_value(value))
-            return result
-        else:
-            # Positional parameters
-            result = sql
-            for value in parameters:
-                result = result.replace('?', self._format_value(value), 1)
-            return result
+        texts = [self._format_value(values[n - 1]) for n in slots]
+        return self._splice(sql, placeholders, texts)
 
     def _format_value(self, value: Any) -> str:
         """Format Python value for SQL."""
         if value is None:
             return 'NULL'
         elif isinstance(value, bool):
-            return 'TRUE' if value else 'FALSE'
-        elif isinstance(value, (int, float)):
-            return str(value)
+            # sqlite3 binds bool as the integer 1 / 0 (HeliosDB accepts
+            # 1 / 0 for BOOLEAN columns too).
+            return '1' if value else '0'
+        elif isinstance(value, int):
+            return str(_embedded.check_int64(int(value)))
+        elif isinstance(value, float):
+            return repr(float(value))
         elif isinstance(value, str):
             # Escape single quotes
             escaped = value.replace("'", "''")
@@ -726,16 +900,52 @@ class Cursor:
             # PostgreSQL hex bytea literal. HeliosDB rejects SQLite's X'..'
             # blob literal ("HexStringLiteral not yet supported").
             return f"'\\x{bytes(value).hex()}'::bytea"
-        elif isinstance(value, (date, datetime)):
+        elif type(value) in _adapters:
+            return self._format_value(_adapters[type(value)](value))
+        elif isinstance(value, datetime):
+            return f"'{value.isoformat(' ')}'"
+        elif isinstance(value, (date, datetime_time)):
             return f"'{value.isoformat()}'"
         else:
-            # Try adapter
-            type_ = type(value)
-            if type_ in _adapters:
-                adapted = _adapters[type_](value)
-                return self._format_value(adapted)
-            else:
-                return f"'{str(value)}'"
+            escaped = str(value).replace("'", "''")
+            return f"'{escaped}'"
+
+
+def _adapt_native(value: Any, index: int) -> Any:
+    """A Python parameter -> a value the in-process binding binds, following
+    sqlite3's rules (bool binds as an integer, ints must fit in 64 bits,
+    registered adapters apply)."""
+    kind = type(value)
+    if value is None or kind is str or kind is bytes or kind is float:
+        return value
+    if kind is int:
+        return _embedded.check_int64(value)
+    adapter = _adapters.get(kind)
+    if adapter is not None:
+        value = adapter(value)
+        if value is None:
+            return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return _embedded.check_int64(int(value))
+    if isinstance(value, float):
+        return float(value)
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, datetime):
+        return value.isoformat(' ')
+    if isinstance(value, (date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (list, tuple)) and value and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in value):
+        return [float(x) for x in value]  # HeliosDB VECTOR
+    raise ProgrammingError(
+        f"Error binding parameter {index}: type '{type(value).__name__}' is not supported")
 
 
 # ============================================================================
@@ -780,7 +990,12 @@ class Connection:
         self.isolation_level = isolation_level
         self.check_same_thread = check_same_thread
         self.row_factory = factory
+        self.text_factory: Callable = str
         self._cached_statements = cached_statements
+        # In-process engine (heliosdb-nano-embedded); None for the REPL and
+        # daemon transports.
+        self._backend: Optional[_embedded.EmbeddedBackend] = None
+        self._heliosdb_process: Any = None
 
         self._closed = False
         self._in_transaction = False
@@ -819,12 +1034,36 @@ class Connection:
         # statements between them share a transaction.
         self._pg_conn: Any = None
 
-        # Initialize HeliosDB connection based on mode
+        # Map SQLite column types in CREATE/ALTER TABLE to HeliosDB types with
+        # the same meaning (64-bit INTEGER, 8-byte REAL, BLOB -> BYTEA, ...;
+        # see _sql.rewrite_ddl_types). sqlite_types=False sends DDL verbatim.
+        self._sqlite_types: bool = bool(kwargs.get('sqlite_types', True))
+        # Daemon mode: wrap each statement inside a transaction in a
+        # savepoint so a failing statement leaves the transaction usable,
+        # as in SQLite. statement_savepoints=False saves the round trips.
+        self._statement_savepoints: bool = bool(kwargs.get('statement_savepoints', True))
+
+        # embedded mode: 'auto' (in-process binding when installed, else the
+        # REPL subprocess with a warning), 'binding' (require the binding)
+        # or 'repl' (always the subprocess).
+        self._embedded_backend: str = str(
+            kwargs.get('embedded_backend')
+            or os.environ.get('HELIOSDB_SQLITE_BACKEND')
+            or 'auto'
+        ).lower()
+
+        # Initialize HeliosDB connection based on mode. As in sqlite3, no
+        # transaction is open yet: one starts implicitly before the first
+        # INSERT/UPDATE/DELETE/REPLACE unless isolation_level is None.
         self._initialize_heliosdb()
 
-        # Auto-begin transaction if isolation level is set
-        if self.isolation_level is not None:
-            self.begin()
+    @property
+    def in_transaction(self) -> bool:
+        """True while a transaction is open (sqlite3.Connection.in_transaction)."""
+        return self._in_transaction
+
+    def _embedded_data_dir(self) -> str:
+        return self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
 
     def _check_thread(self) -> None:
         """Verify we're on the same thread (if check_same_thread=True)."""
@@ -848,14 +1087,40 @@ class Connection:
             raise InterfaceError(f"Unknown mode: {self._mode}")
 
     def _init_embedded_mode(self) -> None:
-        """Initialize embedded REPL mode with persistent process."""
+        """Initialize embedded mode: the in-process binding when available,
+        otherwise the persistent REPL subprocess."""
+        choice = self._embedded_backend
+        if choice not in ('auto', 'binding', 'repl'):
+            raise InterfaceError(
+                f"Unknown embedded_backend {choice!r}; use 'auto', 'binding' or 'repl'")
+        if choice != 'repl':
+            module = _embedded.load_binding()
+            if module is not None:
+                path = None if self.database == ':memory:' else self._embedded_data_dir()
+                try:
+                    self._backend = _embedded.EmbeddedBackend(module, path, self.timeout)
+                except Exception as e:
+                    raise OperationalError(f"unable to open database: {e}") from None
+                return
+            if choice == 'binding':
+                raise InterfaceError(
+                    "embedded_backend='binding' needs the heliosdb-nano-embedded package "
+                    "(pip install heliosdb-nano-embedded)")
+            warnings.warn(
+                "heliosdb-nano-embedded is not installed, so embedded mode drives the "
+                "'heliosdb-nano repl' subprocess, which returns every value as text "
+                "(for example '7' instead of 7). Install it for sqlite3-typed results: "
+                "pip install heliosdb-nano-embedded",
+                RuntimeWarning,
+                stacklevel=5,
+            )
+
         # Determine data directory
         if self.database == ':memory:':
             self._heliosdb_args = ['--memory']
         else:
             # Use database path as data directory
-            data_dir = self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
-            self._heliosdb_args = ['--data-dir', data_dir]
+            self._heliosdb_args = ['--data-dir', self._embedded_data_dir()]
 
         # Start persistent REPL process for state preservation
         self._start_persistent_repl()
@@ -932,10 +1197,47 @@ class Connection:
         Raises:
             DatabaseError: If execution fails
         """
+        if self._backend is not None:
+            return self._execute_bound(sql, [])
         if self._mode == 'embedded' or self._mode == 'hybrid':
             return self._execute_embedded(sql)
         elif self._mode == 'daemon':
             return self._execute_daemon(sql)
+
+    def _execute_bound(self, sql: str, values: List[Any]) -> Union[Dict, int]:
+        """Execute one statement with ``$n`` parameters on the in-process
+        binding, mapping engine errors to sqlite3's exception classes."""
+        try:
+            return self._backend.run(sql, values)
+        except _embedded._LockTimeout:
+            raise OperationalError("database is locked") from None
+        except Error:
+            raise
+        except (OverflowError, ProgrammingError):
+            raise
+        except Exception as e:
+            message = str(e).strip()
+            raise _DRIVER_ERRORS[_embedded.classify_error(message)](message) from None
+
+    def _execute_bound_many(self, sql: str, batch: List[List[Any]]) -> int:
+        try:
+            return self._backend.run_many(sql, batch)
+        except _embedded._LockTimeout:
+            raise OperationalError("database is locked") from None
+        except Error:
+            raise
+        except Exception as e:
+            message = str(e).strip()
+            raise _DRIVER_ERRORS[_embedded.classify_error(message)](message) from None
+
+    def _track_transaction(self, keyword: str, sql: str) -> None:
+        """Follow BEGIN / COMMIT / ROLLBACK the application runs itself."""
+        if keyword in ('BEGIN', 'START'):
+            self._in_transaction = True
+        elif keyword in ('COMMIT', 'END'):
+            self._in_transaction = False
+        elif keyword == 'ROLLBACK' and not _sql.has_keyword(sql, 'TO'):
+            self._in_transaction = False
 
     def _execute_embedded(self, sql: str) -> Union[Dict, int]:
         """Execute SQL in embedded REPL mode using persistent process."""
@@ -1105,29 +1407,57 @@ class Connection:
         self._pg_conn = conn
         return conn
 
+    # Savepoint that confines a failed statement inside a transaction, so
+    # the transaction survives the error as it does in SQLite (PostgreSQL
+    # semantics would abort the whole transaction).
+    _STATEMENT_SAVEPOINT = 'heliosdb_sqlite_stmt'
+    _TRANSACTION_KEYWORDS = frozenset(('BEGIN', 'START', 'COMMIT', 'END', 'ROLLBACK',
+                                       'SAVEPOINT', 'RELEASE'))
+
     def _execute_daemon(self, sql: str) -> Union[Dict, int]:
         """Execute SQL over the PostgreSQL wire protocol on the session."""
         conn = self._daemon_connection()
         import psycopg2
 
+        guard = (self._in_transaction and self._statement_savepoints
+                 and _sql.first_keyword(sql) not in self._TRANSACTION_KEYWORDS)
         try:
             with conn.cursor() as cursor:
-                cursor.execute(sql)
+                if guard:
+                    cursor.execute(f'SAVEPOINT {self._STATEMENT_SAVEPOINT}')
+                try:
+                    cursor.execute(sql)
+                except psycopg2.Error:
+                    if guard:
+                        try:
+                            cursor.execute(f'ROLLBACK TO SAVEPOINT {self._STATEMENT_SAVEPOINT}')
+                            cursor.execute(f'RELEASE SAVEPOINT {self._STATEMENT_SAVEPOINT}')
+                        except psycopg2.Error:
+                            pass
+                    raise
                 if cursor.description is None:
-                    return cursor.rowcount
-                return {
-                    'rows': [list(row) for row in cursor.fetchall()],
-                    'columns': [desc[0] for desc in cursor.description],
-                    # RowDescription type OIDs, one per column
-                    'types': [desc[1] for desc in cursor.description],
-                }
+                    result: Union[Dict, int] = cursor.rowcount
+                else:
+                    result = {
+                        'rows': [list(row) for row in cursor.fetchall()],
+                        'columns': [desc[0] for desc in cursor.description],
+                        # RowDescription type OIDs, one per column
+                        'types': [desc[1] for desc in cursor.description],
+                    }
+                if guard:
+                    cursor.execute(f'RELEASE SAVEPOINT {self._STATEMENT_SAVEPOINT}')
+                return result
         except psycopg2.Error as e:
-            # psycopg2's classes follow the DB-API names; raise ours.
+            # psycopg2's classes follow the DB-API names; raise the class
+            # sqlite3 raises for the same failure (engine errors that are not
+            # integrity or data errors are OperationalError in sqlite3).
             error_class: type = DatabaseError
             for klass in type(e).__mro__:
                 if klass.__name__ in _DRIVER_ERRORS:
                     error_class = _DRIVER_ERRORS[klass.__name__]
                     break
+            if error_class in (ProgrammingError, InternalError):
+                error_class = OperationalError
             raise error_class(str(e).strip()) from None
 
     def _parse_repl_output(self, output: str, sql: str) -> Union[Dict, int]:
@@ -1275,8 +1605,10 @@ class Connection:
             raise ProgrammingError("Cannot operate on closed connection")
 
         if self._in_transaction:
-            self._execute_sql("COMMIT;")
-            self._in_transaction = False
+            try:
+                self._execute_sql("COMMIT;")
+            finally:
+                self._in_transaction = False
 
     def rollback(self) -> None:
         """Rollback current transaction."""
@@ -1285,8 +1617,10 @@ class Connection:
             raise ProgrammingError("Cannot operate on closed connection")
 
         if self._in_transaction:
-            self._execute_sql("ROLLBACK;")
-            self._in_transaction = False
+            try:
+                self._execute_sql("ROLLBACK;")
+            finally:
+                self._in_transaction = False
 
     def begin(self) -> None:
         """Begin explicit transaction."""
@@ -1320,8 +1654,13 @@ class Connection:
                     except Exception:
                         pass
 
+            backend = getattr(self, '_backend', None)
+            if backend is not None:
+                self._backend = None
+                backend.close()
+
             # Terminate persistent REPL process if running
-            if hasattr(self, '_heliosdb_process') and self._heliosdb_process is not None:
+            if getattr(self, '_heliosdb_process', None) is not None:
                 try:
                     # Send quit command gracefully (must encode to bytes)
                     self._heliosdb_process.stdin.write(b'\\q\n')
@@ -1427,7 +1766,7 @@ class Connection:
     def interrupt(self) -> None:
         """Interrupt long-running query."""
         # Send interrupt to HeliosDB process if running
-        if self._heliosdb_process and self._heliosdb_process.poll() is None:
+        if self._heliosdb_process is not None and self._heliosdb_process.poll() is None:
             self._heliosdb_process.terminate()
 
     def set_authorizer(self, authorizer_callback: Optional[Callable]) -> None:
@@ -1506,8 +1845,14 @@ class Connection:
         if self._mode != 'hybrid':
             raise NotSupportedError("switch_to_server only available in hybrid mode")
 
-        # Start server daemon
-        data_dir = self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
+        # Start server daemon on the same data directory; the in-process
+        # engine must let go of it first.
+        data_dir = self._embedded_data_dir()
+        if self._backend is not None:
+            if self._in_transaction:
+                self.commit()
+            self._backend.close()
+            self._backend = None
         cmd = [
             _resolve_binary(), 'start',
             '--data-dir', data_dir,

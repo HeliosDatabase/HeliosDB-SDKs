@@ -217,7 +217,7 @@ def test_cursor_converts_by_type_oid():
         ('id', None, None, None, None, None, None),
         ('code', None, None, None, None, None, None),
     ]
-    assert cur.rowcount == 3
+    assert cur.rowcount == -1  # sqlite3 reports -1 for SELECT
 
 
 def test_row_factory_sees_converted_values():
@@ -257,12 +257,13 @@ def test_lastrowid_from_typed_returning():
 
 @pytest.fixture
 def date_converter():
+    from heliosdb_sqlite import main
+    saved = dict(main._converters)
     heliosdb_sqlite.register_converter('date', lambda b: datetime.date.fromisoformat(b.decode()))
     heliosdb_sqlite.register_converter('blob', lambda b: ('blob', b))
     yield
-    from heliosdb_sqlite import main
-    main._converters.pop('DATE', None)
-    main._converters.pop('BLOB', None)
+    main._converters.clear()
+    main._converters.update(saved)
 
 
 DATE_RESULT = {
@@ -480,6 +481,7 @@ def test_daemon_connect_failure_is_operational_error(fake_pg):
 def test_daemon_lost_connection_mid_transaction_is_reported(fake_pg):
     fake = fake_pg([])
     conn = heliosdb_sqlite.connect('x', mode='daemon')
+    conn.begin()
     fake.connections[0].closed = 2  # server went away
     with pytest.raises(heliosdb_sqlite.OperationalError, match='rolled back'):
         conn._execute_sql('SELECT 1')
@@ -490,7 +492,8 @@ def test_daemon_lost_connection_mid_transaction_is_reported(fake_pg):
 
 def test_daemon_close_after_lost_connection_does_not_raise(fake_pg):
     fake = fake_pg([])
-    conn = heliosdb_sqlite.connect('x', mode='daemon')  # BEGIN sent
+    conn = heliosdb_sqlite.connect('x', mode='daemon')
+    conn.begin()  # BEGIN sent
     fake.connections[0].closed = 2
     conn.close()
     assert len(fake.connections) == 1  # no reconnect just to roll back

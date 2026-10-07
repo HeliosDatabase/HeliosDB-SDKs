@@ -31,7 +31,7 @@ from setuptools.command.install import install
 
 # Package metadata (also defined in pyproject.toml)
 PACKAGE_NAME = "heliosdb-sqlite"
-PACKAGE_VERSION = "3.0.1"
+PACKAGE_VERSION = "3.1.0"
 PACKAGE_DESCRIPTION = (
     "SQLite-compatible interface for HeliosDB with vector search, "
     "encryption, and time-travel queries"
@@ -188,8 +188,8 @@ def get_version() -> str:
 
 def get_requirements() -> List[str]:
     """Get runtime requirements."""
-    # No runtime requirements - all dependencies bundled
-    return []
+    # The in-process engine for embedded mode; wheels exist for Linux x86_64.
+    return ["heliosdb-nano-embedded>=4.31.1; platform_system == 'Linux' and platform_machine == 'x86_64'"]
 
 
 def get_dev_requirements() -> List[str]:
@@ -264,6 +264,9 @@ if __name__ == "__main__":
             ],
             "async": [
                 "aiofiles>=23.0.0",
+            ],
+            "embedded": [
+                "heliosdb-nano-embedded>=4.31.1",
             ],
             "daemon": [
                 "psycopg2-binary>=2.8",

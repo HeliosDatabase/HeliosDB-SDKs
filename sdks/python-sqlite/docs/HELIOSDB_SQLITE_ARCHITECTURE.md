@@ -96,18 +96,32 @@ rows = cursor.fetchall()
 #### Embedded Mode (Default)
 
 ```
-Connection._execute_embedded()
+Cursor._run()
     ↓
-1. Create temp SQL file with bound parameters
-2. Launch: heliosdb repl --data-dir <path>
-3. Redirect stdin from SQL file
-4. Capture stdout/stderr
-5. Parse REPL output into structured results
+1. Map SQLite column types in DDL (_sql.rewrite_ddl_types)
+2. Rewrite ?, ?NNN, :name, @name, $name placeholders to $1..$n
+   (string literals, quoted identifiers and comments are skipped)
+3. EmbeddedBackend.run(): heliosdb_nano.EmbeddedDatabase.query()/execute()
+   in-process -- values come back as int / float / str / bytes / None
+4. Normalise to sqlite3 types (bool -> 1/0, NUMERIC affinity,
+   TIMESTAMP text), using information_schema for declared column types
     ↓
 Return {
     'rows': [[1, 'Alice'], [2, 'Bob']],
-    'columns': ['id', 'name']
+    'columns': ['id', 'name'],
+    'decl_oids': [20, 25],
 }
+```
+
+Without the `heliosdb-nano-embedded` package the layer falls back (with a
+`RuntimeWarning`) to the original transport below, which returns text:
+
+```
+Connection._execute_embedded()
+    ↓
+1. Launch: heliosdb-nano repl --data-dir <path> (kept running)
+2. Write the statement with parameters bound as SQL literals
+3. Parse the printed table into rows of str
 ```
 
 #### Daemon Mode
@@ -462,9 +476,10 @@ except sqlite3.DatabaseError as e:
 
 ## Implementation Notes
 
-### REPL Output Parsing
+### REPL Output Parsing (fallback transport)
 
-The embedded mode parses HeliosDB REPL's ASCII table output:
+Without `heliosdb-nano-embedded`, embedded mode parses HeliosDB REPL's table
+output. The table has no column types, so every value is returned as `str`:
 
 ```
 ┌─────┬────────┐
@@ -500,11 +515,15 @@ cursor.execute("SELECT * FROM users WHERE id = @id", {'id': 1})
 
 Automatic conversion for:
 - `None` → `NULL`
-- `bool` → `TRUE`/`FALSE`
-- `int`, `float` → numeric literals
-- `str` → quoted strings (with escaping)
-- `bytes` → hex strings (`X'...'`)
-- `datetime`, `date`, `time` → ISO format strings
+- `bool` → `1`/`0` (as sqlite3 binds it)
+- `int` (64-bit; larger raises `OverflowError`), `float` → numbers
+- `str` → text (quoted and escaped when bound as a literal)
+- `bytes`, `bytearray`, `memoryview` → bytes (`'\x..'::bytea` as a literal)
+- `datetime` → `'YYYY-MM-DD HH:MM:SS[.ffffff]'`; `date`, `time` → ISO text
+- types with a `register_adapter()` adapter → the adapter's result
+
+In embedded mode on the in-process engine, values are bound as `$n`
+parameters, not spliced into the SQL text.
 
 ## Limitations
 

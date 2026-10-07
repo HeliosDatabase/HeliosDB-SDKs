@@ -118,6 +118,10 @@ Open a connection to a HeliosDB database.
   - `server_password` (str): Password for daemon mode (default: none; libpq's `PGPASSWORD` / `~/.pgpass` apply)
   - `server_database` (str): Database for daemon mode (default: 'heliosdb')
   - `dsn` (str): libpq connection string or `postgresql://` URI for daemon mode; the `server_*` keywords override its fields
+  - `embedded_backend` (str): embedded transport: `'auto'` (default; the in-process `heliosdb-nano-embedded` engine when installed, else the `heliosdb-nano repl` subprocess with a `RuntimeWarning`), `'binding'` (require the in-process engine) or `'repl'`. Also read from `HELIOSDB_SQLITE_BACKEND`.
+  - `sqlite_types` (bool): map SQLite column types in `CREATE TABLE` / `ALTER TABLE ... ADD COLUMN` to HeliosDB types with the same meaning (default: True)
+  - `statement_savepoints` (bool): daemon mode; run each statement inside a transaction under a savepoint so a failing statement leaves the transaction usable, as in SQLite (default: True)
+  - `lastrowid` (bool): set `cursor.lastrowid` after `INSERT` by appending `RETURNING <pk>` (default: True)
 
 **Returns:**
 - `Connection`: Database connection object
@@ -1081,11 +1085,13 @@ In daemon mode, values are converted by the column type the server reports
 | `NULL` | `None` |
 | `TEXT`, `VARCHAR`, `DATE`, `TIMESTAMP`, `UUID`, `JSON`, other types | `str` |
 
+These types apply in embedded mode (values come typed from the in-process
+engine) and in daemon mode (values are converted by the column type OID).
 `detect_types=PARSE_DECLTYPES` applies converters registered for the
-column's server type (`DATE`, `TIMESTAMP`, `INTEGER`, ...);
+column's declared type (`DATE`, `TIMESTAMP`, `INTEGER`, ...);
 `PARSE_COLNAMES` applies the converter named in a `"alias [type]"` column
-alias. Embedded mode reads the untyped table printed by `heliosdb-nano repl`
-and returns every value as `str` (only `PARSE_COLNAMES` converters apply).
+alias. Only the REPL fallback (embedded mode without
+`heliosdb-nano-embedded`) returns every value as `str`.
 
 ## Complete Usage Example
 

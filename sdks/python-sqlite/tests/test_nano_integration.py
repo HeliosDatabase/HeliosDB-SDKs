@@ -161,6 +161,8 @@ def test_lastrowid(conn, table):
 
 
 def test_detect_types_converters(table):
+    from heliosdb_sqlite import main
+    saved = dict(main._converters)
     heliosdb_sqlite.register_converter('DATE', lambda b: datetime.date.fromisoformat(b.decode()[:10]))
     try:
         c = connect(detect_types=heliosdb_sqlite.PARSE_DECLTYPES | heliosdb_sqlite.PARSE_COLNAMES)
@@ -177,8 +179,8 @@ def test_detect_types_converters(table):
         finally:
             c.close()
     finally:
-        from heliosdb_sqlite import main
-        main._converters.pop('DATE', None)
+        main._converters.clear()
+        main._converters.update(saved)
 
 
 def test_transaction_uses_one_session():

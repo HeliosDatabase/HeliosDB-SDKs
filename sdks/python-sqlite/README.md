@@ -14,8 +14,8 @@
 - **Time-Travel Queries** - Access historical data with `AS OF TIMESTAMP`
 - **Database Branching** - Git-like workflows for schema changes
 - **PostgreSQL Types** - Extended type support (JSONB, UUID, VECTOR)
-- **Zero Python Dependencies** - Pure Python; talks to a local HeliosDB Nano executable (daemon mode, which connects to a running server, needs `psycopg2`)
-- **Cross-Platform** - Linux, macOS, Windows support
+- **Typed results, in process** - Embedded mode runs the HeliosDB Nano engine inside your Python process (`heliosdb-nano-embedded`) and returns `int`, `float`, `str`, `bytes` and `None` exactly as `sqlite3` does
+- **Daemon mode** - The same API against a HeliosDB Nano server over the PostgreSQL wire protocol (needs `psycopg2`)
 
 ---
 
@@ -24,20 +24,31 @@
 `heliosdb-sqlite` is not yet published on PyPI; install it from the
 [HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs) repository.
 
-### Requirement: the HeliosDB Nano executable
+### Requirement: the HeliosDB Nano engine
 
-The package is pure Python and drives a local `heliosdb-nano` process
-(`heliosdb-nano repl`). Download `heliosdb-nano` from the
-[HeliosDB-Nano releases](https://github.com/HeliosDatabase/HeliosDB-Nano/releases)
-and put it on your `PATH`, or point `HELIOSDB_BINARY` at it:
+Embedded mode (the default) runs the engine **inside the Python process**
+through the `heliosdb-nano-embedded` package (import name `heliosdb_nano`), a
+PyO3 binding of HeliosDB Nano. It is installed automatically on Linux x86_64,
+the platform it publishes wheels for; elsewhere install it when a wheel for
+your platform is available:
 
 ```bash
-export HELIOSDB_BINARY=/opt/heliosdb/heliosdb-nano
+pip install heliosdb-nano-embedded
 ```
 
-Lookup order: `$HELIOSDB_BINARY`, `heliosdb-nano` on `PATH`, `heliosdb` on
-`PATH`, then a binary bundled under `heliosdb_sqlite/binaries/` (none is
-bundled by the source install below).
+Without it, embedded mode falls back to driving a `heliosdb-nano repl`
+subprocess and emits a `RuntimeWarning`, because that transport reads a
+printed text table and returns **every value as `str`** (`'7'` instead of
+`7`). For the fallback, download `heliosdb-nano` from the
+[HeliosDB-Nano releases](https://github.com/HeliosDatabase/HeliosDB-Nano/releases)
+and put it on your `PATH`, or point `HELIOSDB_BINARY` at it (lookup order:
+`$HELIOSDB_BINARY`, `heliosdb-nano` on `PATH`, `heliosdb` on `PATH`, then a
+binary bundled under `heliosdb_sqlite/binaries/`).
+
+Choose the embedded transport explicitly with
+`connect(..., embedded_backend='binding' | 'repl' | 'auto')` or the
+`HELIOSDB_SQLITE_BACKEND` environment variable. `'binding'` raises
+`InterfaceError` instead of falling back.
 
 ### Standard Installation
 
@@ -62,7 +73,7 @@ pip install "heliosdb-sqlite[all] @ git+https://github.com/HeliosDatabase/Helios
 
 ```bash
 python -c "import heliosdb_sqlite; print(heliosdb_sqlite.__version__)"
-# Output: 3.0.1
+# Output: 3.1.0
 
 # Run comprehensive tests
 python -m heliosdb_sqlite.cli check
@@ -287,36 +298,93 @@ act on the statements run before them, as in `sqlite3`.
 
 ### Result types
 
-Values come back as the Python types `sqlite3` returns for the same data,
-decided by the column type the server reports (the type OID in the
-PostgreSQL RowDescription message), never by what the text looks like:
+Values come back as the Python types `sqlite3` returns for the same data, in
+both embedded and daemon mode:
 
-| Server column type | Python value |
-|--------------------|--------------|
-| `SMALLINT`, `INTEGER`, `BIGINT` | `int` |
-| `REAL`, `DOUBLE PRECISION` | `float` |
+| Column type | Python value |
+|-------------|--------------|
+| `INTEGER`, `BIGINT`, `SMALLINT` | `int` |
+| `REAL`, `FLOAT`, `DOUBLE` | `float` |
 | `NUMERIC` / `DECIMAL` | `int` if integral and within 64 bits, else `float` (SQLite `NUMERIC` affinity) |
 | `BOOLEAN` | `int` `1` / `0` (SQLite has no boolean type) |
-| `BYTEA` | `bytes` |
+| `BLOB` / `BYTEA` | `bytes` |
 | `NULL` | `None` |
-| `TEXT`, `VARCHAR`, `CHAR`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, `VECTOR`, arrays, other types | `str`, as the server sent it |
+| `TEXT`, `VARCHAR`, `CHAR`, `DATE`, `TIME`, `TIMESTAMP`, `UUID`, `JSON`, other types | `str` (`TIMESTAMP` as `YYYY-MM-DD HH:MM:SS[.ffffff]`) |
 
-To get `datetime.date` and similar objects, register a converter and pass
-`detect_types`, as with `sqlite3`. With `PARSE_DECLTYPES` the converter is
-looked up by the column's server type (`DATE`, `TIMESTAMP`, `INTEGER`,
-`BOOLEAN`, `BYTEA`/`BLOB`, ...); with `PARSE_COLNAMES` by a `[type]` suffix in
-the column alias. Converters receive `bytes` and are never called for NULL.
+How each mode knows the type:
+
+- **Embedded** - the in-process engine hands back typed values, the way
+  CPython's `sqlite3` reads `sqlite3_column_type()` for every value and
+  rusqlite exposes `ValueRef::{Integer, Real, Text, Blob, Null}`. Nothing is
+  parsed from text. Parameters are bound natively (`$1..$n`), never spliced
+  into the SQL.
+- **Daemon** - values arrive as text with the column type OID from the
+  PostgreSQL RowDescription message and are converted by that OID, never by
+  what the text looks like (the text `'7'` in a `TEXT` column stays `'7'`).
+
+To get `datetime.date` and similar objects, pass `detect_types`, as with
+`sqlite3`. The `date` and `timestamp` converters `sqlite3` registers are
+registered here too. With `PARSE_DECLTYPES` a converter is looked up by the
+column's declared type (`DATE`, `TIMESTAMP`, `INTEGER`, `BOOLEAN`,
+`BYTEA`/`BLOB`, ...); with `PARSE_COLNAMES` by a `[type]` suffix in the
+column alias. Converters receive `bytes` and are never called for NULL.
+`register_adapter()` adapters apply to parameters, and
+`Connection.text_factory` to text values.
 
 ```python
-heliosdb_sqlite.register_converter('DATE', lambda b: datetime.date.fromisoformat(b.decode()))
-conn = heliosdb_sqlite.connect('app', mode='daemon', dsn=..., detect_types=heliosdb_sqlite.PARSE_DECLTYPES)
+conn = heliosdb_sqlite.connect('app.db', detect_types=heliosdb_sqlite.PARSE_DECLTYPES)
+conn.execute("CREATE TABLE events (day DATE, at TIMESTAMP)")
+conn.execute("INSERT INTO events VALUES (?, ?)", ('2026-10-07', '2026-10-07 12:34:56'))
+conn.execute("SELECT day, at FROM events").fetchone()
+# (datetime.date(2026, 10, 7), datetime.datetime(2026, 10, 7, 12, 34, 56))
 ```
 
-**Embedded mode returns text.** The embedded transport reads the table that
-`heliosdb-nano repl` prints, which carries no column types, so every value
-is a `str` (`NULL` becomes `None`; a text value spelled `NULL` does too).
-`PARSE_COLNAMES` converters still apply. Use daemon mode, or hybrid mode
-after `switch_to_server()`, when you need typed values.
+The REPL fallback (no `heliosdb-nano-embedded`) returns every value as `str`
+(`NULL` becomes `None`; a text value spelled `NULL` does too).
+
+### SQLite schemas
+
+SQLite stores every integer in 64 bits and every `REAL` as an 8-byte double,
+whatever the declared type says, and `INTEGER PRIMARY KEY` is assigned
+automatically. HeliosDB follows PostgreSQL types, so `CREATE TABLE` and
+`ALTER TABLE ... ADD COLUMN` statements are mapped to keep SQLite's meaning:
+
+| Declared in SQLite | Created in HeliosDB |
+|--------------------|---------------------|
+| `INT`, `INTEGER`, `TINYINT`, `SMALLINT`, `MEDIUMINT`, `BIGINT`, `INT2`, `INT8` | `BIGINT` |
+| `INTEGER PRIMARY KEY` | `INTEGER PRIMARY KEY AUTOINCREMENT` (64-bit, assigned when omitted) |
+| `REAL`, `FLOAT`, `DOUBLE` | `DOUBLE PRECISION` |
+| `BLOB` | `BYTEA` |
+| `DATETIME` | `TIMESTAMP` |
+
+Other types (`TEXT`, `VARCHAR(n)`, `NUMERIC(p,s)`, `BOOLEAN`, `DATE`,
+`VECTOR(n)`, ...) are created as written. Pass `sqlite_types=False` to send
+DDL unchanged.
+
+### Transactions
+
+As in `sqlite3`: with the default `isolation_level`, a transaction opens
+implicitly before the first `INSERT`/`UPDATE`/`DELETE`/`REPLACE` and lasts
+until `commit()` or `rollback()`; `isolation_level=None` is autocommit, where
+your own `BEGIN`/`COMMIT` apply. `Connection.in_transaction` reports the
+state, `with conn:` commits or rolls back, and `executescript()` commits a
+pending transaction first. A statement that fails inside a transaction (for
+example with `IntegrityError`) leaves the transaction usable.
+
+In embedded mode, `connect(':memory:')` gives each connection its own
+database. Connections to the same database directory in one process share
+the engine; while one of them has a transaction open, the others wait up to
+`timeout` seconds and then raise `OperationalError: database is locked`.
+
+### Known differences from sqlite3
+
+- Two result columns with the same name (`SELECT 1 AS a, 2 AS a`) collapse to
+  one in embedded mode (the binding returns rows as dicts).
+- `REAL` columns created by other tools as 4-byte `float4` return the
+  shortest decimal that round-trips (`0.1`), not the widened double.
+- After explicit ids, `AUTOINCREMENT` keys continue from their own sequence
+  rather than from the largest id in the table.
+- SQLite-specific functions such as `typeof()` are not available.
 
 ### Exception Handling
 
@@ -346,13 +414,10 @@ finally:
 
 ## Platform Support
 
-| Platform | Architecture | Status | Wheel Available |
-|----------|--------------|--------|-----------------|
-| **Linux** | x86_64 | ✅ Stable | ✅ manylinux2014 |
-| **Linux** | aarch64 | ✅ Stable | ✅ manylinux2014 |
-| **macOS** | x86_64 (Intel) | ✅ Stable | ✅ 10.12+ |
-| **macOS** | arm64 (Apple Silicon) | ✅ Stable | ✅ 11.0+ |
-| **Windows** | x86_64 | ✅ Stable | ✅ Win10+ |
+| Platform | Embedded mode | Daemon mode |
+|----------|---------------|-------------|
+| Linux x86_64 (glibc 2.28+) | In-process engine (`heliosdb-nano-embedded` wheel) | Yes |
+| Other platforms | REPL fallback (text values) until a binding wheel is published | Yes |
 
 ### Python Version Support
 
@@ -388,7 +453,7 @@ finally:
 
 | Feature | sqlite3 | heliosdb-sqlite |
 |---------|---------|-----------------|
-| **SQLite API** | ✅ | ✅ 100% compatible |
+| **sqlite3 DB-API** | ✅ | ✅ (see Known differences) |
 | **Vector Search** | ❌ | ✅ Built-in HNSW + PQ |
 | **Encryption** | ❌ | ✅ AES-256-GCM |
 | **Time-Travel** | ❌ | ✅ AS OF queries |
@@ -438,10 +503,11 @@ cd HeliosDB-SDKs/sdks/python-sqlite
 # Install in development mode
 pip install -e ".[dev]"
 
-# Run tests
+# Run tests; tests/test_sqlite3_conformance.py runs every case on CPython's
+# sqlite3 and on heliosdb_sqlite and requires identical values and types
 pytest tests/ -v
 
-# Run the integration tests against a throwaway HeliosDB Nano server
+# Run the integration and conformance tests against a throwaway HeliosDB Nano server
 # (Linux Docker host; the server is removed afterwards)
 scripts/nano-integration-test.sh -v
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run tests/test_nano_integration.py against a throwaway HeliosDB Nano server.
+# Run tests/test_nano_integration.py and the sqlite3 conformance suite
+# (tests/test_sqlite3_conformance.py) against a throwaway HeliosDB Nano server.
 #
 #   scripts/nano-integration-test.sh [extra pytest arguments]
 #
@@ -64,4 +65,4 @@ echo "Testing $IMAGE on a private network"
 cd "$PACKAGE_DIR"
 HELIOSDB_TEST_URL="postgresql://postgres@$HOST:5432/heliosdb" \
 HELIOSDB_TEST_PASSWORD_FILE="$PASSWORD_FILE" \
-  "$PYTHON" -m pytest tests/test_nano_integration.py "$@"
+  "$PYTHON" -m pytest tests/test_nano_integration.py tests/test_sqlite3_conformance.py "$@"

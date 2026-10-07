@@ -7,6 +7,7 @@ pytest-asyncio>=0.21.0
 pytest-timeout>=2.1.0
 pytest-xdist>=3.0.0
 psycopg2-binary>=2.8  # daemon mode + integration tests
+heliosdb-nano-embedded>=4.31.1; platform_system == 'Linux' and platform_machine == 'x86_64'  # embedded mode + conformance tests
 
 # Type checking
 mypy>=1.0.0

@@ -186,7 +186,7 @@ TYPE_NAMES: Dict[int, Tuple[str, ...]] = {
     VARCHAR: ('VARCHAR',),
     DATE: ('DATE',),
     TIME: ('TIME',),
-    TIMESTAMP: ('TIMESTAMP',),
+    TIMESTAMP: ('TIMESTAMP', 'DATETIME'),
     TIMESTAMPTZ: ('TIMESTAMPTZ',),
     INTERVAL: ('INTERVAL',),
     TIMETZ: ('TIMETZ',),

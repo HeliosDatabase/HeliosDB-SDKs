@@ -1,7 +1,7 @@
 """Version information for heliosdb-sqlite."""
 
-__version__ = "3.0.1"
-__version_info__ = (3, 0, 1)
+__version__ = "3.1.0"
+__version_info__ = (3, 1, 0)
 
 # HeliosDB binary version
 __heliosdb_version__ = "3.0.0"
