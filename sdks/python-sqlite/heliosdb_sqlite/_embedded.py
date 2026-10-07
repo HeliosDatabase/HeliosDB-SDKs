@@ -57,6 +57,7 @@ _DATA_TYPE_OIDS = {
 }
 
 _ROW_KEYWORDS = frozenset(('SELECT', 'WITH', 'VALUES', 'SHOW', 'EXPLAIN', 'TABLE', 'DESCRIBE'))
+_WRITE_KEYWORDS = frozenset(('INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'MERGE', 'UPSERT'))
 _DDL_KEYWORDS = frozenset(('CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME'))
 _EMPTY_PROBE_KEYWORDS = frozenset(('SELECT', 'WITH', 'VALUES'))
 _PROBE_COLUMN = '__heliosdb_sqlite_probe'
@@ -235,6 +236,13 @@ class EmbeddedBackend:
     def _run(self, keyword: str, sql: str, params: Sequence[Any]) -> Union[Dict[str, Any], int]:
         db = self._db()
         bound = list(params) if params else None
+        if bound is None and keyword in _WRITE_KEYWORDS:
+            # heliosdb-nano-embedded 4.31.1: execute(sql) without parameters
+            # runs UPDATE / DELETE outside the open transaction's view, so
+            # rows written earlier in the transaction are not matched (0
+            # rows). The parameterised path is correct; an unused parameter
+            # selects it.
+            bound = [None]
         if keyword in _DDL_KEYWORDS:
             self._columns_cache.clear()
         if keyword == 'PRAGMA':

@@ -43,6 +43,11 @@ version_info = (3, 1, 0)
 sqlite_version = "3.45.0 (HeliosDB compatible)"
 sqlite_version_info = (3, 45, 0)
 
+# DB-API 2.0 (PEP 249) module globals, as in sqlite3
+apilevel = "2.0"
+threadsafety = 1      # threads may share the module, not connections
+paramstyle = "qmark"  # ?, plus :name / ?NNN / @name / $name as in sqlite3
+
 # Parse constants
 PARSE_DECLTYPES = 1
 PARSE_COLNAMES = 2
@@ -387,6 +392,10 @@ class Cursor:
             return sql, None
         if self._RETURNING_RE.search(sql):
             return sql, None
+        info = _sql.parse_insert(sql)
+        if info is not None and info.rows is None and not info.default_values:
+            # INSERT ... SELECT: HeliosDB does not accept RETURNING here.
+            return sql, None
         table = m.group('qname') or m.group('pname') or ''
         # Drop schema prefix (`public.users` → `users`); PRAGMA table_info
         # is name-only.
@@ -453,6 +462,7 @@ class Cursor:
     ) -> None:
         """Execute one statement and load its result into the cursor."""
         conn = self.connection
+        user_sql = sql
         if conn._sqlite_types:
             sql = _sql.rewrite_ddl_types(sql)
         keyword = _sql.first_keyword(sql)
@@ -474,6 +484,18 @@ class Cursor:
                 and not conn._in_transaction and keyword in self._DML_KEYWORDS):
             conn.begin()
 
+        # SQLite schema semantics (sqlite_types=True): INTEGER PRIMARY KEY
+        # assignment and the declared-type catalog.
+        rowid_plan: Optional[_RowidPlan] = None
+        schema_state = None
+        if conn._sqlite_types:
+            if keyword in ('INSERT', 'REPLACE'):
+                stmt, values, rowid_plan = conn._rowid_prepare_insert(stmt, values)
+            elif keyword == 'UPDATE':
+                rowid_plan = conn._rowid_prepare_update(stmt)
+            elif keyword in ('CREATE', 'DROP', 'ALTER'):
+                schema_state = conn._schema_before(user_sql, keyword)
+
         if self._INSERT_RE.match(stmt):
             self.lastrowid = None
         stmt, lastrowid_pk = self._maybe_inject_returning(stmt)
@@ -489,6 +511,10 @@ class Cursor:
             raise DatabaseError(f"Error executing SQL: {e}") from None
 
         conn._track_transaction(keyword, stmt)
+        if rowid_plan is not None:
+            conn._rowid_after(rowid_plan)
+        if keyword in ('CREATE', 'DROP', 'ALTER'):
+            conn._schema_after(schema_state)
 
         if isinstance(results, dict):
             # Query result. 'types' holds the column type OIDs from the
@@ -497,7 +523,7 @@ class Cursor:
             columns = results.get('columns', [])
             self._results = self._convert_rows(
                 results.get('rows', []), columns, results.get('types'),
-                results.get('decl_oids'),
+                results.get('decl_oids'), stmt,
             )
             self._result_index = 0
             self.description = [
@@ -528,6 +554,8 @@ class Cursor:
             self._result_index = 0
             self.description = None
             self.rowcount = results if isinstance(results, int) else -1
+        if keyword in self._DML_KEYWORDS and self.rowcount > 0:
+            conn._total_changes += self.rowcount
 
     def executemany(self, sql: str, seq_of_parameters: Any) -> 'Cursor':
         """
@@ -548,17 +576,34 @@ class Cursor:
         total = 0
         backend = conn._backend
         if backend is not None and keyword in self._DML_KEYWORDS:
-            # One engine call for the whole batch.
-            stmt = None
-            batch = []
+            # One engine call per run of rows with the same statement text
+            # (an INTEGER PRIMARY KEY given as None becomes DEFAULT, which
+            # changes the text), in order, so keys are assigned as in SQLite.
+            groups: List[List[Any]] = []   # [stmt, [values, ...], plan]
+            update_plan = None
             for parameters in seq_of_parameters:
                 stmt_i, values = self._bind_native(sql, parameters)
-                stmt = stmt_i
-                batch.append(values)
-            if batch:
+                plan = None
+                if conn._sqlite_types and keyword in ('INSERT', 'REPLACE'):
+                    stmt_i, values, plan = conn._rowid_prepare_insert(stmt_i, values)
+                elif conn._sqlite_types and keyword == 'UPDATE':
+                    if update_plan is None:
+                        update_plan = conn._rowid_prepare_update(stmt_i) or False
+                    plan = update_plan or None
+                if groups and groups[-1][0] == stmt_i:
+                    groups[-1][1].append(values)
+                    if plan is not None:
+                        groups[-1][2] = plan if groups[-1][2] is None else groups[-1][2].merge(plan)
+                else:
+                    groups.append([stmt_i, [values], plan])
+            if groups:
                 if conn.isolation_level is not None and not conn._in_transaction:
                     conn.begin()
-                total = conn._execute_bound_many(stmt, batch)
+                for stmt_i, batch, plan in groups:
+                    total += conn._execute_bound_many(stmt_i, batch)
+                    if plan is not None:
+                        conn._rowid_after(plan)
+                conn._total_changes += max(total, 0)
         else:
             disabled = conn._lastrowid_disabled
             conn._lastrowid_disabled = True  # no RETURNING rewrite per row
@@ -689,11 +734,14 @@ class Cursor:
                 return name[:pos]
         return name
 
-    def _lookup_converter(self, name: Any, type_oid: Optional[int]) -> Optional[Callable]:
+    def _lookup_converter(self, name: Any, type_oid: Optional[int],
+                          decltype: Optional[str] = None) -> Optional[Callable]:
         """Converter registered with register_converter() for a column, the
         way sqlite3 picks one: a ``[type]`` in the column name first
-        (PARSE_COLNAMES), then the column's type (PARSE_DECLTYPES), which
-        here comes from the server's type OID."""
+        (PARSE_COLNAMES), then the column's declared type (PARSE_DECLTYPES):
+        its first word, as written in CREATE TABLE (``decltype``, '' for a
+        result column that is not a table column), or, for tables created
+        without this layer, the names of the column's type OID."""
         detect = self.connection.detect_types or 0
         if detect & PARSE_COLNAMES and isinstance(name, str):
             start = name.find('[')
@@ -702,6 +750,9 @@ class Cursor:
                 converter = _converters.get(name[start + 1:end].upper())
                 if converter is not None:
                     return converter
+        if detect & PARSE_DECLTYPES and decltype is not None:
+            word = re.split(r'[\s(]', decltype.strip(), 1)[0].upper()
+            return _converters.get(word) if word else None
         if detect & PARSE_DECLTYPES and type_oid is not None:
             for type_name in _types.TYPE_NAMES.get(type_oid, ()):
                 converter = _converters.get(type_name)
@@ -715,6 +766,7 @@ class Cursor:
         columns: List[str],
         type_oids: Optional[List[Optional[int]]],
         decl_oids: Optional[List[Optional[int]]] = None,
+        sql: Optional[str] = None,
     ) -> List[List[Any]]:
         """Turn transport rows into sqlite3-typed rows.
 
@@ -738,8 +790,13 @@ class Cursor:
         ]
         converters: List[Optional[Callable]] = [None] * ncols
         if self.connection.detect_types and _converters:
+            decltypes: List[Optional[str]] = [None] * ncols
+            if self.connection.detect_types & PARSE_DECLTYPES and sql:
+                found = self.connection._result_decltypes(sql, columns)
+                decltypes = [found[i] if i < len(found) else None for i in range(ncols)]
             converters = [
-                self._lookup_converter(columns[i] if i < len(columns) else None, oids[i])
+                self._lookup_converter(columns[i] if i < len(columns) else None, oids[i],
+                                       decltypes[i])
                 for i in range(ncols)
             ]
         text_factory = getattr(self.connection, 'text_factory', str)
@@ -877,11 +934,17 @@ class Cursor:
         placeholders, slots, values = self._plan_bindings(sql, parameters)
         if not placeholders:
             return sql
-        texts = [self._format_value(values[n - 1]) for n in slots]
+        texts = [self._format_value(values[n - 1], n) for n in slots]
         return self._splice(sql, placeholders, texts)
 
-    def _format_value(self, value: Any) -> str:
-        """Format Python value for SQL."""
+    def _format_value(self, value: Any, index: int = 1) -> str:
+        """A Python parameter as a SQL literal (REPL and wire transports),
+        following sqlite3's binding rules: registered adapters apply, bool
+        binds as 1 / 0, ints must fit in 64 bits, NaN binds as NULL, and a
+        type sqlite3 cannot bind raises the error sqlite3 raises."""
+        adapter = _adapters.get(type(value))
+        if adapter is not None:
+            value = adapter(value)
         if value is None:
             return 'NULL'
         elif isinstance(value, bool):
@@ -891,24 +954,82 @@ class Cursor:
         elif isinstance(value, int):
             return str(_embedded.check_int64(int(value)))
         elif isinstance(value, float):
+            if value != value:
+                return 'NULL'
+            if value in (float('inf'), float('-inf')):
+                return "'Infinity'::float8" if value > 0 else "'-Infinity'::float8"
             return repr(float(value))
         elif isinstance(value, str):
-            # Escape single quotes
-            escaped = value.replace("'", "''")
-            return f"'{escaped}'"
+            return _sql_literal(value)
         elif isinstance(value, (bytes, bytearray, memoryview)):
             # PostgreSQL hex bytea literal. HeliosDB rejects SQLite's X'..'
             # blob literal ("HexStringLiteral not yet supported").
             return f"'\\x{bytes(value).hex()}'::bytea"
-        elif type(value) in _adapters:
-            return self._format_value(_adapters[type(value)](value))
         elif isinstance(value, datetime):
-            return f"'{value.isoformat(' ')}'"
+            return _sql_literal(value.isoformat(' '))
         elif isinstance(value, (date, datetime_time)):
-            return f"'{value.isoformat()}'"
-        else:
-            escaped = str(value).replace("'", "''")
-            return f"'{escaped}'"
+            return _sql_literal(value.isoformat())
+        elif isinstance(value, Decimal):
+            return _sql_literal(str(value))
+        elif _is_vector(value):
+            # HeliosDB VECTOR, as in embedded mode
+            return _sql_literal('[' + ', '.join(repr(float(x)) for x in value) + ']')
+        raise _unsupported_parameter(value, index)
+
+
+def _unsupported_parameter(value: Any, index: int) -> Exception:
+    """The exception sqlite3 raises for a parameter of a type it cannot
+    bind: ProgrammingError on Python 3.11+, InterfaceError before."""
+    if sys.version_info >= (3, 11):
+        return ProgrammingError(
+            f"Error binding parameter {index}: type '{type(value).__name__}' is not supported")
+    return InterfaceError(f"Error binding parameter {index - 1} - probably unsupported type.")
+
+
+def _is_vector(value: Any) -> bool:
+    return isinstance(value, (list, tuple)) and bool(value) and all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)
+
+
+def _sql_literal(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+class _RowidPlan:
+    """Work left after an INSERT/UPDATE that set an INTEGER PRIMARY KEY
+    explicitly: move the table's rowid sequence past the largest key."""
+
+    __slots__ = ('table', 'column', 'sequence', 'max_known', 'unknown')
+
+    def __init__(self, table: str, column: str, sequence: str,
+                 max_known: Optional[int], unknown: bool):
+        self.table = table
+        self.column = column
+        self.sequence = sequence
+        self.max_known = max_known
+        self.unknown = unknown
+
+    def merge(self, other: Optional['_RowidPlan']) -> '_RowidPlan':
+        if other is not None:
+            if other.max_known is not None:
+                self.max_known = (other.max_known if self.max_known is None
+                                  else max(self.max_known, other.max_known))
+            self.unknown = self.unknown or other.unknown
+        return self
+
+
+_ROWID_DEFAULT_RE = re.compile(
+    r"^\s*nextval\(\s*'([a-z0-9_]+" + re.escape(_sql.ROWID_SEQUENCE_SUFFIX) + r")'")
+_INT_LITERAL_RE = re.compile(r'^[-+]?\d+$')
+_NATIVE_PARAM_RE = re.compile(r'^\$(\d+)$')
+_UPDATE_HEAD_RE = re.compile(
+    r'\s*UPDATE\s+(?:OR\s+\w+\s+)?(?P<n1>"[^"]+"|[\w$]+)(?:\s*\.\s*(?P<n2>"[^"]+"|[\w$]+))?'
+    r'(?:\s+(?:AS\s+)?[A-Za-z_]\w*)?\s+SET\b', re.IGNORECASE)
+_SET_END_RE = re.compile(r'\b(?:WHERE|RETURNING|FROM|ORDER|LIMIT)\b', re.IGNORECASE)
 
 
 def _adapt_native(value: Any, index: int) -> Any:
@@ -916,6 +1037,8 @@ def _adapt_native(value: Any, index: int) -> Any:
     sqlite3's rules (bool binds as an integer, ints must fit in 64 bits,
     registered adapters apply)."""
     kind = type(value)
+    if kind is float and value != value:
+        return None  # sqlite3 binds NaN as NULL
     if value is None or kind is str or kind is bytes or kind is float:
         return value
     if kind is int:
@@ -941,11 +1064,9 @@ def _adapt_native(value: Any, index: int) -> Any:
         return value.isoformat()
     if isinstance(value, Decimal):
         return str(value)
-    if isinstance(value, (list, tuple)) and value and all(
-            isinstance(x, (int, float)) and not isinstance(x, bool) for x in value):
+    if _is_vector(value):
         return [float(x) for x in value]  # HeliosDB VECTOR
-    raise ProgrammingError(
-        f"Error binding parameter {index}: type '{type(value).__name__}' is not supported")
+    raise _unsupported_parameter(value, index)
 
 
 # ============================================================================
@@ -1038,6 +1159,19 @@ class Connection:
         # the same meaning (64-bit INTEGER, 8-byte REAL, BLOB -> BYTEA, ...;
         # see _sql.rewrite_ddl_types). sqlite_types=False sends DDL verbatim.
         self._sqlite_types: bool = bool(kwargs.get('sqlite_types', True))
+        # Record each column's declared type (as written in CREATE TABLE)
+        # in the heliosdb_sqlite_decltypes table, so PARSE_DECLTYPES finds
+        # converters by the declared name (INTEGER, DATETIME, POINT, ...)
+        # like sqlite3_column_decltype(). declared_types=False turns it off.
+        self._declared_types: bool = self._sqlite_types and bool(kwargs.get('declared_types', True))
+        self._catalog_exists: Optional[bool] = None
+        self._decltype_cache: Dict[str, Dict[str, str]] = {}
+        # INTEGER PRIMARY KEY tables: (column, sequence, ordinal) per table,
+        # and the value each sequence is known to be at or past.
+        self._rowid_cache: Dict[str, Optional[Tuple[str, str, int]]] = {}
+        self._rowid_hw: Dict[str, int] = {}
+        self._insert_parse_cache: Dict[str, Optional[_sql.InsertInfo]] = {}
+        self._total_changes = 0
         # Daemon mode: wrap each statement inside a transaction in a
         # savepoint so a failing statement leaves the transaction usable,
         # as in SQLite. statement_savepoints=False saves the round trips.
@@ -1063,7 +1197,32 @@ class Connection:
         return self._in_transaction
 
     def _embedded_data_dir(self) -> str:
-        return self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
+        """The engine's data directory for ``database``.
+
+        Each database path is its own database, as in sqlite3: the path
+        itself is used as the engine's data directory (``app.db/``).
+        ``data_dir=`` overrides it. Versions before 3.1.0 stored every
+        database of a directory in one shared ``heliosdb-data`` directory
+        next to it; when that exists and the path does not, it is still
+        used (with a warning) so existing data stays reachable."""
+        if self._data_dir:
+            return str(self._data_dir)
+        path = Path(self.database)
+        legacy = path.parent / 'heliosdb-data'
+        if not path.exists() and legacy.is_dir():
+            warnings.warn(
+                f"heliosdb_sqlite: using the shared data directory {str(legacy)!r} "
+                f"created by an earlier version, which every database in "
+                f"{str(path.parent)!r} shares. Move it to {str(path)!r} (or pass "
+                f"data_dir=) to give this database its own storage.",
+                RuntimeWarning, stacklevel=4)
+            return str(legacy)
+        if path.is_file():
+            raise OperationalError(
+                f"unable to open database: {str(path)!r} is a file (an SQLite "
+                "database?); HeliosDB keeps a database in a directory. Pass "
+                "data_dir= or a new path.")
+        return str(path)
 
     def _check_thread(self) -> None:
         """Verify we're on the same thread (if check_same_thread=True)."""
@@ -1238,6 +1397,319 @@ class Connection:
             self._in_transaction = False
         elif keyword == 'ROLLBACK' and not _sql.has_keyword(sql, 'TO'):
             self._in_transaction = False
+
+    # ------------------------------------------------------------------
+    # SQLite schema semantics: rowid assignment and declared column types
+    # ------------------------------------------------------------------
+
+    DECLTYPE_CATALOG = 'heliosdb_sqlite_decltypes'
+
+    @property
+    def total_changes(self) -> int:
+        """Rows inserted, updated or deleted through this Connection since
+        it was opened (sqlite3.Connection.total_changes)."""
+        return self._total_changes
+
+    @property
+    def _schema_bookkeeping(self) -> bool:
+        """Rowid sequence upkeep and the declared-type catalog need typed
+        catalog queries: the in-process binding or daemon mode, not the
+        text REPL fallback."""
+        return self._sqlite_types and (self._backend is not None or self._mode == 'daemon')
+
+    def _internal_rows(self, sql: str) -> List[List[Any]]:
+        """Run an internal statement (catalog lookups, sequence upkeep)
+        outside any Cursor; returns its rows."""
+        result = self._execute_sql(sql)
+        if isinstance(result, dict):
+            return [list(r) for r in result.get('rows', [])]
+        return []
+
+    def _invalidate_schema_caches(self) -> None:
+        self._rowid_cache.clear()
+        self._rowid_hw.clear()
+        self._decltype_cache.clear()
+        self._insert_parse_cache.clear()
+        self._lastrowid_pk_cache.clear()
+
+    def _table_exists(self, table: str) -> bool:
+        rows = self._internal_rows(
+            'SELECT table_name FROM information_schema.tables '
+            f'WHERE table_name = {_sql_literal(table)}')
+        return bool(rows)
+
+    def _rowid_info(self, table: str) -> Optional[Tuple[str, str, int]]:
+        """``(column, sequence, 0-based position)`` of ``table``'s INTEGER
+        PRIMARY KEY (a column whose default draws from a ``*_rowid_seq``
+        sequence created by this layer), or None."""
+        if table in self._rowid_cache:
+            return self._rowid_cache[table]
+        if not self._schema_bookkeeping:
+            return None
+        info = None
+        try:
+            rows = self._internal_rows(
+                'SELECT column_name, column_default, ordinal_position FROM '
+                f'information_schema.columns WHERE table_name = {_sql_literal(table)}')
+            rows = [r for r in rows if len(r) >= 3]
+            rows.sort(key=lambda r: int(r[2] or 0))
+            for position, row in enumerate(rows):
+                m = _ROWID_DEFAULT_RE.match(str(row[1] or ''))
+                if m:
+                    info = (str(row[0]), m.group(1), position)
+                    break
+        except (Error, TypeError, ValueError):
+            info = None
+        if len(self._rowid_cache) > 256:
+            self._rowid_cache.clear()
+        self._rowid_cache[table] = info
+        return info
+
+    def _rowid_prepare_insert(self, stmt: str, values: Optional[List[Any]]
+                              ) -> Tuple[str, Optional[List[Any]], Optional[_RowidPlan]]:
+        """SQLite assigns an INTEGER PRIMARY KEY when an INSERT gives NULL
+        for it: turn such NULLs into DEFAULT, and note explicit keys so the
+        sequence can be moved past them afterwards."""
+        if stmt in self._insert_parse_cache:
+            info = self._insert_parse_cache[stmt]
+        else:
+            info = _sql.parse_insert(stmt)
+            if len(self._insert_parse_cache) > 64:
+                self._insert_parse_cache.clear()
+            self._insert_parse_cache[stmt] = info
+        if info is None or info.default_values:
+            return stmt, values, None
+        rowid = self._rowid_info(info.table)
+        if rowid is None:
+            return stmt, values, None
+        column, sequence, position = rowid
+        if info.columns is not None:
+            if column in info.columns:
+                position = info.columns.index(column)
+            else:
+                return stmt, values, None  # key omitted: assigned by the sequence
+        if info.rows is None:
+            return stmt, values, _RowidPlan(info.table, column, sequence, None, True)
+        known: List[int] = []
+        unknown = False
+        to_default: List[Tuple[int, int]] = []
+        for row in info.rows:
+            if position >= len(row):
+                unknown = True
+                continue
+            start, end = row[position]
+            expr = stmt[start:end].strip()
+            upper = expr.upper()
+            if upper == 'DEFAULT':
+                continue
+            if upper == 'NULL':
+                to_default.append((start, end))
+                continue
+            m = _NATIVE_PARAM_RE.match(expr)
+            if m and values is not None and 0 < int(m.group(1)) <= len(values):
+                value = values[int(m.group(1)) - 1]
+                if value is None:
+                    to_default.append((start, end))
+                elif isinstance(value, int):
+                    known.append(int(value))
+                else:
+                    unknown = True
+                continue
+            if _INT_LITERAL_RE.match(expr):
+                known.append(int(expr))
+            else:
+                unknown = True
+        for start, end in reversed(to_default):
+            stmt = stmt[:start] + ' DEFAULT' + stmt[end:]
+        if not known and not unknown:
+            return stmt, values, None
+        return stmt, values, _RowidPlan(info.table, column, sequence,
+                                        max(known) if known else None, unknown)
+
+    def _rowid_prepare_update(self, stmt: str) -> Optional[_RowidPlan]:
+        """An UPDATE that assigns an INTEGER PRIMARY KEY may move it past
+        the sequence; note it so the sequence follows."""
+        m = _UPDATE_HEAD_RE.match(stmt)
+        if not m:
+            return None
+        table = _sql.identifier_name(m.group('n2') or m.group('n1'))
+        rowid = self._rowid_info(table)
+        if rowid is None:
+            return None
+        column, sequence, _ = rowid
+        start = m.end()
+        end = len(stmt)
+        for s0, e0 in _sql.code_spans(stmt):
+            if e0 <= start:
+                continue
+            found = _SET_END_RE.search(stmt, max(s0, start), e0)
+            if found:
+                end = found.start()
+                break
+        bounds = [start - 1] + _sql._top_level_commas(stmt, start, end) + [end]
+        for a, b in zip(bounds, bounds[1:]):
+            lhs = stmt[a + 1:b].split('=', 1)[0].strip()
+            if lhs and _sql.identifier_name(lhs.split('.')[-1]) == column:
+                return _RowidPlan(table, column, sequence, None, True)
+        return None
+
+    def _rowid_after(self, plan: _RowidPlan) -> None:
+        """Move the rowid sequence past the largest explicit key, so the
+        next INSERT that omits the key gets max + 1 as in SQLite."""
+        try:
+            top = plan.max_known
+            if plan.unknown:
+                rows = self._internal_rows(
+                    f'SELECT max({_sql_ident(plan.column)}) FROM {_sql_ident(plan.table)}')
+                if rows and rows[0][0] is not None:
+                    found = int(rows[0][0])
+                    top = found if top is None else max(top, found)
+            if top is None or top < 1 or top <= self._rowid_hw.get(plan.table, 0):
+                return
+            seq = _sql_literal(plan.sequence)
+            rows = self._internal_rows(
+                f'SELECT setval({seq}, GREATEST(nextval({seq}) - 1, {int(top)}))')
+            self._rowid_hw[plan.table] = int(rows[0][0]) if rows and rows[0][0] is not None else top
+        except (Error, TypeError, ValueError):
+            # The row is stored; only automatic keys after it are affected.
+            warnings.warn(
+                f"heliosdb_sqlite: could not advance the INTEGER PRIMARY KEY sequence of "
+                f"{plan.table!r}; a later INSERT without a key may collide", RuntimeWarning)
+
+    def _schema_before(self, user_sql: str, keyword: str) -> Optional[Tuple[str, Any]]:
+        """Bookkeeping before a CREATE / DROP / ALTER TABLE runs."""
+        if not self._schema_bookkeeping:
+            return None
+        try:
+            if keyword == 'CREATE':
+                create = _sql.parse_create_table(user_sql)
+                if create is None:
+                    return None
+                existed = self._table_exists(create.table)
+                if not existed and create.rowid_column is not None:
+                    # A new table starts its keys at 1, as in SQLite, even
+                    # if an older table of the same name left a sequence.
+                    seq = _sql.rowid_sequence_name(create.table, create.rowid_column)
+                    self._internal_rows(f'DROP SEQUENCE IF EXISTS {seq}')
+                    self._internal_rows(f'CREATE SEQUENCE {seq}')
+                return ('create', (create, existed))
+            if keyword == 'DROP':
+                tables = _sql.dropped_tables(user_sql)
+                if not tables:
+                    return None
+                return ('drop', [(t, self._rowid_info(t)) for t in tables])
+            if keyword == 'ALTER':
+                alter = _sql.parse_alter_table(user_sql)
+                return ('alter', alter) if alter is not None else None
+        except Error:
+            return None
+        return None
+
+    def _schema_after(self, state: Optional[Tuple[str, Any]]) -> None:
+        """Bookkeeping after a CREATE / DROP / ALTER TABLE succeeded."""
+        self._invalidate_schema_caches()
+        if state is None:
+            return
+        kind, data = state
+        try:
+            if kind == 'create':
+                create, existed = data
+                if not existed and self._declared_types and create.columns:
+                    self._catalog_write(create.table, create.columns)
+            elif kind == 'drop':
+                for table, rowid in data:
+                    if rowid is not None:
+                        self._internal_rows(f'DROP SEQUENCE IF EXISTS {rowid[1]}')
+                    if self._declared_types and self._catalog_ready():
+                        self._internal_rows(
+                            f'DELETE FROM {self.DECLTYPE_CATALOG} '
+                            f'WHERE table_name = {_sql_literal(table)}')
+            elif kind == 'alter' and self._declared_types:
+                table, action, args = data
+                if action == 'add_column':
+                    self._catalog_write(table, [args], replace=False)
+                elif not self._catalog_ready():
+                    return
+                elif action == 'rename_table':
+                    self._internal_rows(
+                        f'UPDATE {self.DECLTYPE_CATALOG} SET table_name = {_sql_literal(args[0])} '
+                        f'WHERE table_name = {_sql_literal(table)}')
+                elif action == 'rename_column':
+                    self._internal_rows(
+                        f'UPDATE {self.DECLTYPE_CATALOG} SET column_name = {_sql_literal(args[1])} '
+                        f'WHERE table_name = {_sql_literal(table)} '
+                        f'AND column_name = {_sql_literal(args[0])}')
+                elif action == 'drop_column':
+                    self._internal_rows(
+                        f'DELETE FROM {self.DECLTYPE_CATALOG} WHERE table_name = {_sql_literal(table)} '
+                        f'AND column_name = {_sql_literal(args[0])}')
+        except Error as e:
+            warnings.warn(f"heliosdb_sqlite: could not record declared column types: {e}",
+                          RuntimeWarning)
+
+    def _catalog_ready(self, create: bool = False) -> bool:
+        if not self._schema_bookkeeping:
+            return False
+        if self._catalog_exists:
+            return True
+        self._catalog_exists = self._table_exists(self.DECLTYPE_CATALOG)
+        if not self._catalog_exists and create:
+            self._internal_rows(
+                f'CREATE TABLE IF NOT EXISTS {self.DECLTYPE_CATALOG} ('
+                'table_name TEXT NOT NULL, column_name TEXT NOT NULL, decltype TEXT NOT NULL)')
+            self._catalog_exists = True
+        return bool(self._catalog_exists)
+
+    def _catalog_write(self, table: str, columns: List[Tuple[str, str]],
+                       replace: bool = True) -> None:
+        columns = [(name, decl) for name, decl in columns if decl]
+        if not columns:
+            return
+        self._catalog_ready(create=True)
+        names = ', '.join(_sql_literal(name) for name, _ in columns)
+        where = f'table_name = {_sql_literal(table)}'
+        self._internal_rows(f'DELETE FROM {self.DECLTYPE_CATALOG} WHERE {where}'
+                            + ('' if replace else f' AND column_name IN ({names})'))
+        rows = ', '.join(f'({_sql_literal(table)}, {_sql_literal(name)}, {_sql_literal(decl)})'
+                         for name, decl in columns)
+        self._internal_rows(f'INSERT INTO {self.DECLTYPE_CATALOG} '
+                            f'(table_name, column_name, decltype) VALUES {rows}')
+
+    def _declared_types_of(self, table: str) -> Dict[str, str]:
+        cached = self._decltype_cache.get(table)
+        if cached is not None:
+            return cached
+        types: Dict[str, str] = {}
+        try:
+            if self._catalog_ready():
+                for row in self._internal_rows(
+                        f'SELECT column_name, decltype FROM {self.DECLTYPE_CATALOG} '
+                        f'WHERE table_name = {_sql_literal(table)}'):
+                    if len(row) == 2 and row[0] is not None and row[1] is not None:
+                        types[str(row[0])] = str(row[1])
+        except Error:
+            types = {}
+        self._decltype_cache[table] = types
+        return types
+
+    def _result_decltypes(self, sql: str, columns: List[Any]) -> List[Optional[str]]:
+        """Declared type of each result column that names a column of a
+        table in the statement (sqlite3_column_decltype); None otherwise."""
+        if not self._declared_types or not columns:
+            return [None] * len(columns)
+        maps = [self._declared_types_of(t) for t in _sql.referenced_tables(sql)]
+        maps = [m for m in maps if m]
+        out: List[Optional[str]] = []
+        for name in columns:
+            found = {m[name] for m in maps if isinstance(name, str) and name in m}
+            if len(found) == 1:
+                out.append(found.pop())
+            else:
+                # Not a column of a recorded table (an expression, or
+                # ambiguous): no declared type, as in sqlite3. With no
+                # recorded table at all, fall back to the type OID.
+                out.append('' if maps and not found else None)
+        return out
 
     def _execute_embedded(self, sql: str) -> Union[Dict, int]:
         """Execute SQL in embedded REPL mode using persistent process."""
@@ -2016,6 +2488,9 @@ __all__ = [
     'DataError',
 
     # Constants
+    'apilevel',
+    'threadsafety',
+    'paramstyle',
     'PARSE_DECLTYPES',
     'PARSE_COLNAMES',
     'SQLITE_OK',

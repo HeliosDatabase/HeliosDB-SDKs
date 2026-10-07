@@ -20,9 +20,11 @@ BOOLEAN                                     ``int`` 1 / 0 (SQLite has
                                             no boolean type)
 BYTEA                                       ``bytes``
 NULL (any type)                             ``None``
+TIMESTAMP, TIMESTAMPTZ                      ``str``, with the fraction's
+                                            trailing zeros removed
 TEXT, VARCHAR, CHAR, JSON, UUID, DATE,      ``str``, exactly as the
-TIME, TIMESTAMP, VECTOR, arrays, any other  server sent it (SQLite
-type                                        stores these as TEXT)
+TIME, VECTOR, arrays, any other type        server sent it (SQLite
+                                            stores these as TEXT)
 ==========================================  ===========================
 
 The mapping is driven only by the type OID, never by the shape of the value,
@@ -30,6 +32,7 @@ so the text ``'7'`` in a TEXT column stays ``'7'`` and ``'NULL'`` stays a
 string.
 """
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
@@ -144,6 +147,23 @@ def _to_bytes(value: Any) -> bytes:
     return bytes(out)
 
 
+_FRACTION_RE = re.compile(r'(\d{2}:\d{2}:\d{2})\.(\d+)')
+
+
+def _to_timestamp_text(value: Any) -> str:
+    """TIMESTAMP text without the trailing zeros the server pads the
+    fraction with: '2026-10-07 12:34:56.000000' -> '2026-10-07 12:34:56',
+    '... 12:34:56.500000' -> '... 12:34:56.5' (the in-process binding
+    renders timestamps the same way)."""
+    text = _as_text(value)
+
+    def trim(m: 're.Match') -> str:
+        frac = m.group(2).rstrip('0')
+        return m.group(1) + ('.' + frac if frac else '')
+
+    return _FRACTION_RE.sub(trim, text, count=1)
+
+
 def _to_text(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).decode('utf-8')
@@ -162,6 +182,8 @@ _CONVERTERS: Dict[int, Callable[[Any], Any]] = {
     NUMERIC: _to_numeric,
     BOOL: _to_bool,
     BYTEA: _to_bytes,
+    TIMESTAMP: _to_timestamp_text,
+    TIMESTAMPTZ: _to_timestamp_text,
 }
 
 # OID -> type names tried, in order, against converters registered with
@@ -231,6 +253,10 @@ def converter_input(type_oid: Optional[int], value: Any) -> bytes:
     does: the stored bytes for BYTEA, otherwise the value's text in UTF-8."""
     if type_oid == BYTEA:
         return _to_bytes(value)
+    if type_oid == BOOL:
+        return b'1' if _to_bool(value) else b'0'  # SQLite stores booleans as 1 / 0
+    if type_oid in (TIMESTAMP, TIMESTAMPTZ):
+        return _to_timestamp_text(value).encode('utf-8')
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value)
     return str(value).encode('utf-8')

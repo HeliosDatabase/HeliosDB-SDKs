@@ -50,10 +50,21 @@ def test_first_keyword_and_has_keyword():
 
 @pytest.mark.parametrize('sql,expected', [
     ('CREATE TABLE t (id INTEGER PRIMARY KEY, n INT, r REAL, b BLOB, d DATETIME)',
-     'CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, n BIGINT, r DOUBLE PRECISION, '
-     'b BYTEA, d TIMESTAMP)'),
+     "CREATE TABLE t (id BIGINT PRIMARY KEY DEFAULT nextval('t_id_rowid_seq'), n BIGINT, "
+     "r DOUBLE PRECISION, b BYTEA, d TIMESTAMP)"),
     ('create table if not exists s.t(id integer primary key autoincrement, x tinyint)',
-     'create table if not exists s.t(id INTEGER primary key autoincrement, x BIGINT)'),
+     "create table if not exists s.t(id BIGINT primary key DEFAULT nextval('t_id_rowid_seq'), "
+     "x BIGINT)"),
+    # table-level PRIMARY KEY on an INTEGER column is a rowid alias too
+    ('CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))',
+     "CREATE TABLE t (a BIGINT DEFAULT nextval('t_a_rowid_seq'), b TEXT, PRIMARY KEY (a))"),
+    # ... but not a composite key, or INTEGER under another name
+    ('CREATE TABLE t (a INTEGER, b INT, PRIMARY KEY (a, b))',
+     'CREATE TABLE t (a BIGINT, b BIGINT, PRIMARY KEY (a, b))'),
+    ('CREATE TABLE t (a BIGINT PRIMARY KEY)', 'CREATE TABLE t (a BIGINT PRIMARY KEY)'),
+    # names HeliosDB does not know are mapped by SQLite affinity
+    ('CREATE TABLE t (p POINT, m MYTYPE, c NCHAR(5), k MONEY, f FLOATY, bb BOOL, x TEXT[])',
+     'CREATE TABLE t (p POINT, m TEXT, c TEXT, k TEXT, f DOUBLE PRECISION, bb BOOLEAN, x TEXT[])'),
     ("CREATE TABLE t (p DECIMAL(10, 2), s TEXT DEFAULT 'REAL, BLOB', v VARCHAR(5), "
      "PRIMARY KEY (s), CHECK (p > 0))",
      "CREATE TABLE t (p DECIMAL(10, 2), s TEXT DEFAULT 'REAL, BLOB', v VARCHAR(5), "

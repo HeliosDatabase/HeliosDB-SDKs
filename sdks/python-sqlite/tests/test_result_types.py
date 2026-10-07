@@ -119,8 +119,8 @@ def test_bytea_is_bytes(text, expected):
     (VARCHAR, 'A2'),
     (BPCHAR, 'abc  '),  # CHAR(n) padding is kept, as the server sent it
     (DATE, '2026-01-02'),
-    (TIMESTAMP, '2026-01-02 03:04:05.000000'),
-    (TIMESTAMPTZ, '2026-01-02 03:04:05.000000+00'),
+    (TIMESTAMP, '2026-01-02 03:04:05'),
+    (TIMESTAMPTZ, '2026-01-02 03:04:05+00'),
     (UUID, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
     (JSON, '{"a":1}'),
     (JSONB, '{"b": 2}'),
@@ -130,6 +130,18 @@ def test_bytea_is_bytes(text, expected):
 def test_text_like_types_are_str(oid, text):
     value = convert_value(oid, text)
     assert value == text and type(value) is str
+
+
+@pytest.mark.parametrize('oid,text,expected', [
+    # the server pads the fraction; SQLite returns the stored text, and the
+    # in-process binding renders it without the padding
+    (TIMESTAMP, '2026-01-02 03:04:05.000000', '2026-01-02 03:04:05'),
+    (TIMESTAMP, '2026-01-02 03:04:05.500000', '2026-01-02 03:04:05.5'),
+    (TIMESTAMPTZ, '2026-01-02 03:04:05.000000+00', '2026-01-02 03:04:05+00'),
+])
+def test_timestamp_padding_is_removed(oid, text, expected):
+    assert convert_value(oid, text) == expected
+
 
 
 @pytest.mark.parametrize('oid', [INT2, INT4, INT8, FLOAT4, FLOAT8, NUMERIC, BOOL,

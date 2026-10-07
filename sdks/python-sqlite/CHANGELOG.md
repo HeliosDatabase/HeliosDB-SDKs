@@ -35,17 +35,58 @@ All notable changes to `heliosdb-sqlite` are listed here.
   `DatabaseError`.
 - `Row` name lookup is case-insensitive and rows compare equal, as
   `sqlite3.Row`.
+- `INTEGER PRIMARY KEY` is assigned as in SQLite after rows with explicit
+  keys: explicit `2` then an `INSERT` without a key gives `3` (embedded mode
+  stored a second row with key `2`; daemon mode raised `IntegrityError`), and
+  explicit `100` then automatic gives `101` (both modes gave `7`). The key
+  column now draws from a per-table sequence (`<table>_<column>_rowid_seq`)
+  that the layer moves past each explicit key it inserts (also through
+  `executemany()`, `INSERT ... SELECT` and `UPDATE ... SET id = ...`). `NULL` /
+  `None` for the key assigns one, as in SQLite. `PRIMARY KEY (id)` on an
+  `INTEGER` column is treated the same way.
+- `PARSE_DECLTYPES` looks converters up by the declared type as written in
+  `CREATE TABLE` (`INTEGER`, `REAL`, `DATETIME`, custom names such as
+  `POINT`), as `sqlite3` does. Previously the name was rebuilt from the
+  engine's type (`BIGINT`, `DOUBLE`, `TIMESTAMP`, `TEXT`), so converters for
+  `INTEGER`, `REAL` and custom names were never called and `DATETIME` got the
+  built-in `timestamp` converter. Declared types are recorded in the
+  `heliosdb_sqlite_decltypes` table (`declared_types=False` turns that off).
+  Expression columns get no converter, as in `sqlite3`.
+- Type names HeliosDB does not know (`MYTYPE`, `MONEY`, `NCHAR(5)`, ...) no
+  longer fail `CREATE TABLE`; they are mapped by SQLite's affinity rules.
+  `BOOL` becomes `BOOLEAN`.
+- Parameters of types `sqlite3` cannot bind (`object()`, `dict`, `set`, ...)
+  raise the error `sqlite3` raises (`ProgrammingError` on Python 3.11+,
+  `InterfaceError` before) in both modes. Daemon mode used to store their
+  `repr()` text. `float('inf')` works in daemon mode, and `NaN` binds as
+  `NULL` in both modes, as in `sqlite3`.
+- Converters registered for `BOOLEAN` receive `b'1'` / `b'0'` in both modes
+  (daemon mode passed `b't'`), and `TIMESTAMP` text read without converters is
+  the stored text in both modes (daemon mode padded it to `.000000`).
+- Each database path is its own database in embedded mode: `connect('a.db')`
+  and `connect('b.db')` in one directory used to share one `heliosdb-data/`
+  directory and see each other's tables. The path itself is now the engine's
+  data directory. An existing shared `heliosdb-data/` is still used, with a
+  `RuntimeWarning`, when the path does not exist.
+- Embedded mode works around a `heliosdb-nano-embedded` 4.31.1 issue where an
+  `UPDATE` / `DELETE` without parameters inside a transaction did not see rows
+  written earlier in that transaction (0 rows changed).
+- `INSERT ... SELECT` into a table with an integer primary key no longer fails
+  with a parse error (no `RETURNING` is appended to it; `lastrowid` is
+  `None`).
 
 ### Added
 
 - SQLite schemas keep their meaning: in `CREATE TABLE` / `ALTER TABLE ... ADD
   COLUMN`, integer types become `BIGINT` (64-bit), `INTEGER PRIMARY KEY`
-  becomes `INTEGER PRIMARY KEY AUTOINCREMENT` (assigned when omitted),
+  becomes a 64-bit key assigned when omitted (see Fixed),
   `REAL`/`FLOAT`/`DOUBLE` become `DOUBLE PRECISION`, `BLOB` becomes `BYTEA`
   and `DATETIME` becomes `TIMESTAMP`. `sqlite_types=False` disables this.
 - Embedded mode answers `PRAGMA table_info(...)` and ignores other pragmas
   the engine does not know, as SQLite ignores unknown pragmas.
 - `cursor.description` is filled for queries that return no rows.
+- The DB-API module globals `apilevel`, `threadsafety` and `paramstyle`, and
+  `Connection.total_changes`.
 - The default `date` and `timestamp` converters of `sqlite3`, and
   `Connection.text_factory`.
 - `tests/test_sqlite3_conformance.py`: every case runs on CPython's `sqlite3`

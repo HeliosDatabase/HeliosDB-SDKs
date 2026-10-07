@@ -47,6 +47,9 @@ from .main import (
     DataError,
 
     # Constants
+    apilevel,
+    threadsafety,
+    paramstyle,
     PARSE_DECLTYPES,
     PARSE_COLNAMES,
     SQLITE_OK,
@@ -93,6 +96,9 @@ __all__ = [
     'InterfaceError',
     'InternalError',
     'DataError',
+    'apilevel',
+    'threadsafety',
+    'paramstyle',
     'PARSE_DECLTYPES',
     'PARSE_COLNAMES',
     'SQLITE_OK',

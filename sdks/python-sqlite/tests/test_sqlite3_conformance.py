@@ -452,3 +452,224 @@ def test_register_adapter(pair):
         sqlite3.adapters.pop((Point, sqlite3.PrepareProtocol), None)
         from heliosdb_sqlite import main
         main._adapters.pop(Point, None)
+
+
+# --------------------------------------------------------------------------
+# INTEGER PRIMARY KEY (rowid alias) assignment
+# --------------------------------------------------------------------------
+
+def _insert_both(pair, sql, params=()):
+    ref, hdb = pair.both(sql, params)
+    assert hdb.lastrowid == ref.lastrowid, sql
+    assert hdb.rowcount == ref.rowcount, sql
+
+
+@pytest.mark.parametrize('ddl', [
+    '(id INTEGER PRIMARY KEY, v TEXT)',
+    '(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)',
+    '(id INTEGER, v TEXT, PRIMARY KEY (id))',
+])
+def test_integer_primary_key_after_explicit_ids(pair, ddl):
+    t = pair.table()
+    pair.both(f'CREATE TABLE {t} {ddl}')
+    _insert_both(pair, f"INSERT INTO {t} (id, v) VALUES (2, 'explicit')")
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('auto')")          # 3, not 2
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('auto2')")         # 4
+    _insert_both(pair, f"INSERT INTO {t} (id, v) VALUES (?, ?)", (100, 'x'))
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('y')")             # 101
+    _insert_both(pair, f"INSERT INTO {t} VALUES (NULL, 'null literal')")  # 102
+    _insert_both(pair, f"INSERT INTO {t} (id, v) VALUES (?, ?)", (None, 'None param'))
+    _insert_both(pair, f"INSERT INTO {t} (id, v) VALUES (50, 'below'), (NULL, 'next')")
+    pair.hdb.commit()
+    pair.ref.commit()
+    pair.same_rows(f'SELECT id, v FROM {t} ORDER BY id')
+    pair.same_rows(f'SELECT count(*) FROM {t} WHERE id = 2')
+
+
+def test_integer_primary_key_executemany_mixed(pair):
+    t = pair.table()
+    pair.both(f'CREATE TABLE {t} (id INTEGER PRIMARY KEY, v TEXT)')
+    rows = [(None, 'a'), (500, 'b'), (None, 'c'), (None, 'd'), (7, 'e'), (None, 'f')]
+    ref = pair.ref.executemany(f'INSERT INTO {t} (id, v) VALUES (?, ?)', rows)
+    hdb = pair.hdb.executemany(f'INSERT INTO {t} (id, v) VALUES (?, ?)', rows)
+    assert hdb.rowcount == ref.rowcount == len(rows)
+    pair.same_rows(f'SELECT id, v FROM {t} ORDER BY id')
+
+
+def test_integer_primary_key_update_and_insert_select(pair):
+    t = pair.table()
+    pair.both(f'CREATE TABLE {t} (id INTEGER PRIMARY KEY, v TEXT)')
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('a')")
+    pair.both(f"UPDATE {t} SET id = 40 WHERE v = 'a'")
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('b')")            # 41
+    pair.both(f"INSERT INTO {t} (id, v) SELECT id + 100, v FROM {t}")   # 140, 141
+    _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('c')")            # 142
+    pair.same_rows(f'SELECT id, v FROM {t} ORDER BY id')
+
+
+def test_recreated_table_starts_keys_at_one(pair):
+    t = pair.table()
+    for _ in range(2):
+        pair.both(f'CREATE TABLE {t} (id INTEGER PRIMARY KEY, v TEXT)')
+        _insert_both(pair, f"INSERT INTO {t} (id, v) VALUES (9, 'x')")
+        _insert_both(pair, f"INSERT INTO {t} (v) VALUES ('y')")
+        pair.same_rows(f'SELECT id, v FROM {t} ORDER BY id')
+        pair.hdb.commit()
+        pair.ref.commit()
+        pair.both(f'DROP TABLE {t}')
+
+
+def test_integer_primary_key_survives_reopen(tmp_path):
+    if not _binding_installed():
+        pytest.skip('heliosdb-nano-embedded is not installed')
+    path = str(tmp_path / 'rowid.db')
+    conn = heliosdb_sqlite.connect(path, embedded_backend='binding')
+    conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)')
+    conn.execute("INSERT INTO t (id, v) VALUES (2, 'explicit')")
+    cur = conn.execute("INSERT INTO t (v) VALUES ('auto')")
+    assert cur.lastrowid == 3
+    conn.commit()
+    conn.close()
+    conn = heliosdb_sqlite.connect(path, embedded_backend='binding')
+    try:
+        assert conn.execute('SELECT id, v FROM t ORDER BY id').fetchall() == [
+            (2, 'explicit'), (3, 'auto')]
+        assert conn.execute("INSERT INTO t (v) VALUES ('again')").lastrowid == 4
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Parameters sqlite3 cannot bind, and float specials
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('value', [object(), {'a': 1}, {1, 2}])
+def test_unsupported_parameter_types_raise_like_sqlite3(pair, value):
+    with pytest.raises(sqlite3.Error) as ref_error:
+        pair.ref.execute('SELECT ?', (value,))
+    with pytest.raises(heliosdb_sqlite.Error) as hdb_error:
+        pair.hdb.execute('SELECT ?', (value,))
+    assert type(hdb_error.value).__name__ == type(ref_error.value).__name__
+
+
+@pytest.mark.parametrize('value', [float('inf'), float('-inf'), float('nan')])
+def test_float_specials(pair, value):
+    pair.same_rows('SELECT ?', (value,))
+    t = pair.table()
+    pair.both(f'CREATE TABLE {t} (r REAL)')
+    pair.both(f'INSERT INTO {t} VALUES (?)', (value,))
+    pair.same_rows(f'SELECT r FROM {t}')
+
+
+# --------------------------------------------------------------------------
+# Declared types (PARSE_DECLTYPES) and TIMESTAMP text
+# --------------------------------------------------------------------------
+
+_DECL_NAMES = ('INTEGER', 'REAL', 'DATETIME', 'POINT', 'BOOLEAN', 'MYTYPE')
+
+
+@pytest.fixture
+def decl_converters():
+    from heliosdb_sqlite import main
+    for name in _DECL_NAMES:
+        def convert(data, name=name):
+            assert type(data) is bytes
+            return (name, data)
+        sqlite3.register_converter(name, convert)
+        heliosdb_sqlite.register_converter(name, convert)
+    yield
+    for name in _DECL_NAMES:
+        sqlite3.converters.pop(name, None)
+        main._converters.pop(name, None)
+
+
+def test_decltype_converters_use_the_declared_name(backend, decl_converters):
+    p = Pair(backend, detect_types=sqlite3.PARSE_DECLTYPES)
+    try:
+        t = p.table()
+        p.both(f'CREATE TABLE {t} (a INTEGER, b REAL, f DATETIME, p POINT, '
+               f'z BOOLEAN, m MYTYPE, s TEXT)')
+        p.both(f'INSERT INTO {t} VALUES (?, ?, ?, ?, ?, ?, ?)',
+               (1, 1.5, '2026-10-07 12:34:56', '1;2', True, 'custom', 'plain'))
+        ref, hdb = p.both(f'SELECT a, b, f, p, z, m, s, a + 1 FROM {t}')
+        assert hdb.fetchall() == ref.fetchall()
+        # a column added later keeps its declared name too (committed first:
+        # HeliosDB Nano cannot yet read rows written earlier in the same
+        # transaction after ADD COLUMN)
+        p.hdb.commit()
+        p.ref.commit()
+        p.both(f'ALTER TABLE {t} ADD COLUMN extra INTEGER')
+        p.both(f'UPDATE {t} SET extra = 5')
+        ref, hdb = p.both(f'SELECT extra FROM {t}')
+        assert hdb.fetchall() == ref.fetchall()
+    finally:
+        p.close()
+
+
+def test_timestamp_text_is_returned_as_stored(pair):
+    t = pair.table()
+    pair.both(f'CREATE TABLE {t} (f DATETIME, g TIMESTAMP)')
+    pair.both(f'INSERT INTO {t} VALUES (?, ?)', ('2026-10-07 12:34:56', '2026-10-07 12:34:56.5'))
+    pair.same_rows(f'SELECT f, g FROM {t}')
+
+
+# --------------------------------------------------------------------------
+# DB-API module globals and Connection.total_changes
+# --------------------------------------------------------------------------
+
+def test_module_globals():
+    for name in ('apilevel', 'threadsafety', 'paramstyle'):
+        assert hasattr(heliosdb_sqlite, name)
+    assert heliosdb_sqlite.apilevel == sqlite3.apilevel == '2.0'
+    assert heliosdb_sqlite.paramstyle == sqlite3.paramstyle == 'qmark'
+    assert heliosdb_sqlite.threadsafety in (1, 3)
+
+
+def test_total_changes(pair):
+    t = pair.table()
+    assert pair.hdb.total_changes == pair.ref.total_changes == 0
+    pair.both(f'CREATE TABLE {t} (id INTEGER PRIMARY KEY, v TEXT)')
+    pair.both(f"INSERT INTO {t} (v) VALUES ('a'), ('b'), ('c')")
+    pair.both(f"UPDATE {t} SET v = 'z' WHERE id > 1")
+    pair.ref.executemany(f'INSERT INTO {t} (v) VALUES (?)', [('d',), ('e',)])
+    pair.hdb.executemany(f'INSERT INTO {t} (v) VALUES (?)', [('d',), ('e',)])
+    pair.both(f'DELETE FROM {t} WHERE id = 1')
+    assert pair.hdb.total_changes == pair.ref.total_changes == 8
+
+
+# --------------------------------------------------------------------------
+# One database per path (embedded)
+# --------------------------------------------------------------------------
+
+def test_each_path_is_its_own_database(tmp_path):
+    if not _binding_installed():
+        pytest.skip('heliosdb-nano-embedded is not installed')
+    a = heliosdb_sqlite.connect(str(tmp_path / 'a.db'), embedded_backend='binding')
+    b = heliosdb_sqlite.connect(str(tmp_path / 'b.db'), embedded_backend='binding')
+    try:
+        a.execute('CREATE TABLE only_in_a (x INTEGER)')
+        with pytest.raises(heliosdb_sqlite.OperationalError):
+            b.execute('SELECT * FROM only_in_a')
+        b.execute('CREATE TABLE only_in_a (y TEXT)')  # no clash
+        assert (tmp_path / 'a.db').exists() and (tmp_path / 'b.db').exists()
+    finally:
+        a.close()
+        b.close()
+
+
+def test_legacy_shared_data_directory_still_opens(tmp_path):
+    if not _binding_installed():
+        pytest.skip('heliosdb-nano-embedded is not installed')
+    legacy = tmp_path / 'heliosdb-data'
+    old = heliosdb_sqlite.connect('x', embedded_backend='binding', data_dir=str(legacy))
+    old.execute('CREATE TABLE kept (v TEXT)')
+    old.execute("INSERT INTO kept VALUES ('still here')")
+    old.commit()
+    old.close()
+    with pytest.warns(RuntimeWarning, match='shared data directory'):
+        conn = heliosdb_sqlite.connect(str(tmp_path / 'app.db'), embedded_backend='binding')
+    try:
+        assert conn.execute('SELECT v FROM kept').fetchall() == [('still here',)]
+    finally:
+        conn.close()

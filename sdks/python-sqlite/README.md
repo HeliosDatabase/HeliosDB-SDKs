@@ -100,8 +100,8 @@ cursor.execute('INSERT INTO users VALUES (?, ?)', (1, 'Alice'))
 conn.commit()
 
 cursor.execute('SELECT * FROM users')
-print(cursor.fetchall())  # [('1', 'Alice')]: embedded mode returns text,
-                          # daemon mode [(1, 'Alice')]; see "Result types"
+print(cursor.fetchall())  # [(1, 'Alice')] in embedded and daemon mode;
+                          # see "Result types"
 
 conn.close()
 ```
@@ -253,10 +253,11 @@ for row in cursor:
 
 ### `cursor.lastrowid`
 
-After an `INSERT` into a table whose primary key is an integer column
-(`INTEGER`, `BIGINT`, `SERIAL`, ...), `cursor.lastrowid` holds the key of
-the inserted row, as in `sqlite3`. For a multi-row `INSERT` it is the key of
-the last row. Tables without an integer primary key leave it `None`.
+After an `INSERT ... VALUES` into a table whose primary key is an integer
+column (`INTEGER`, `BIGINT`, `SERIAL`, ...), `cursor.lastrowid` holds the key
+of the inserted row, as in `sqlite3`. For a multi-row `INSERT` it is the key
+of the last row. Tables without an integer primary key, and
+`INSERT ... SELECT`, leave it `None`.
 
 ```python
 cur.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
@@ -325,11 +326,31 @@ How each mode knows the type:
 To get `datetime.date` and similar objects, pass `detect_types`, as with
 `sqlite3`. The `date` and `timestamp` converters `sqlite3` registers are
 registered here too. With `PARSE_DECLTYPES` a converter is looked up by the
-column's declared type (`DATE`, `TIMESTAMP`, `INTEGER`, `BOOLEAN`,
-`BYTEA`/`BLOB`, ...); with `PARSE_COLNAMES` by a `[type]` suffix in the
-column alias. Converters receive `bytes` and are never called for NULL.
+first word of the column's declared type exactly as written in
+`CREATE TABLE` (`INTEGER`, `REAL`, `DATETIME`, `BOOLEAN`, `DATE`,
+`TIMESTAMP`, or a custom name such as `POINT`), like
+`sqlite3_column_decltype()`; result columns that are expressions have no
+declared type and get no converter, as in `sqlite3`. With `PARSE_COLNAMES`
+a converter is looked up by a `[type]` suffix in the column alias.
+Converters receive the stored value's `bytes` (`b'1'` for a true
+`BOOLEAN`, `b'1.5'` for a `REAL`) and are never called for NULL.
 `register_adapter()` adapters apply to parameters, and
 `Connection.text_factory` to text values.
+
+HeliosDB stores its own column types (`INTEGER` is created as `BIGINT`, see
+"SQLite schemas"), so this layer records each column's declared type when it
+runs `CREATE TABLE` / `ALTER TABLE ... ADD COLUMN`, in a small table named
+`heliosdb_sqlite_decltypes` (much as SQLite keeps `sqlite_sequence`).
+`connect(..., declared_types=False)` turns the recording off; for tables
+created without it, converters are looked up by the engine's type
+(`BIGINT`, `DOUBLE`, `TIMESTAMP`, ...).
+
+Parameters follow `sqlite3`'s binding rules in both modes: `None`, `int`,
+`float`, `str`, `bytes`/`bytearray`/`memoryview` (plus `date`/`datetime`,
+`Decimal`, registered adapters, and lists of numbers for HeliosDB `VECTOR`
+columns). Any other type (an `object`, `dict`, `set`, ...) raises the error
+`sqlite3` raises (`ProgrammingError` on Python 3.11+, `InterfaceError`
+before). `float('inf')` round-trips; `NaN` binds as `NULL`, as in `sqlite3`.
 
 ```python
 conn = heliosdb_sqlite.connect('app.db', detect_types=heliosdb_sqlite.PARSE_DECLTYPES)
@@ -339,27 +360,55 @@ conn.execute("SELECT day, at FROM events").fetchone()
 # (datetime.date(2026, 10, 7), datetime.datetime(2026, 10, 7, 12, 34, 56))
 ```
 
+`TIMESTAMP` / `DATETIME` values read without a converter come back as the
+text that was stored (`'2026-10-07 12:34:56'`), in both modes.
+
 The REPL fallback (no `heliosdb-nano-embedded`) returns every value as `str`
 (`NULL` becomes `None`; a text value spelled `NULL` does too).
 
 ### SQLite schemas
 
 SQLite stores every integer in 64 bits and every `REAL` as an 8-byte double,
-whatever the declared type says, and `INTEGER PRIMARY KEY` is assigned
-automatically. HeliosDB follows PostgreSQL types, so `CREATE TABLE` and
-`ALTER TABLE ... ADD COLUMN` statements are mapped to keep SQLite's meaning:
+whatever the declared type says, accepts any type name, and assigns
+`INTEGER PRIMARY KEY` automatically. HeliosDB follows PostgreSQL types, so
+`CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` statements are mapped to keep
+SQLite's meaning:
 
 | Declared in SQLite | Created in HeliosDB |
 |--------------------|---------------------|
 | `INT`, `INTEGER`, `TINYINT`, `SMALLINT`, `MEDIUMINT`, `BIGINT`, `INT2`, `INT8` | `BIGINT` |
-| `INTEGER PRIMARY KEY` | `INTEGER PRIMARY KEY AUTOINCREMENT` (64-bit, assigned when omitted) |
+| `INTEGER PRIMARY KEY` (also `PRIMARY KEY (id)` on an `INTEGER` column, and `AUTOINCREMENT`) | `BIGINT PRIMARY KEY DEFAULT nextval('<table>_<column>_rowid_seq')` |
 | `REAL`, `FLOAT`, `DOUBLE` | `DOUBLE PRECISION` |
 | `BLOB` | `BYTEA` |
 | `DATETIME` | `TIMESTAMP` |
+| `BOOL` | `BOOLEAN` |
+| any name HeliosDB does not know (`MYTYPE`, `MONEY`, `NCHAR(5)`, ...) | by SQLite's affinity rules: contains `INT` -> `BIGINT`; `CHAR`/`CLOB`/`TEXT` -> `TEXT`; `BLOB` -> `BYTEA`; `REAL`/`FLOA`/`DOUB` -> `DOUBLE PRECISION`; otherwise `TEXT` |
 
-Other types (`TEXT`, `VARCHAR(n)`, `NUMERIC(p,s)`, `BOOLEAN`, `DATE`,
-`VECTOR(n)`, ...) are created as written. Pass `sqlite_types=False` to send
-DDL unchanged.
+Types HeliosDB knows (`TEXT`, `VARCHAR(n)`, `NUMERIC(p,s)`, `BOOLEAN`,
+`DATE`, `TIMESTAMP`, `UUID`, `JSON`, `VECTOR(n)`, arrays, ...) are created as
+written. The declared names are kept for `PARSE_DECLTYPES` (see "Result
+types"). Pass `sqlite_types=False` to send DDL unchanged.
+
+`INTEGER PRIMARY KEY` behaves like SQLite's rowid alias: an `INSERT` that
+omits the key, or gives `NULL` / `None` for it, gets one more than the
+largest key used so far, also after rows inserted with explicit keys
+(explicit `2` then automatic gives `3`; explicit `100` then automatic gives
+`101`). The keys come from a per-table sequence that this layer moves past
+every explicit key it inserts (including `executemany()` and `UPDATE ...
+SET id = ...`); a new table of the same name starts again at `1`.
+
+### Database files
+
+In embedded mode each path is its own database, as in `sqlite3`:
+`connect('app.db')` keeps its data in the directory `app.db/` (HeliosDB
+stores a database as a directory, not a single file). `data_dir=` chooses
+another directory. An existing SQLite file at the path is not opened; use a
+new path or `data_dir=`.
+
+Versions before 3.1.0 kept every database of a directory in one shared
+`heliosdb-data/` directory next to the path. If that directory exists and
+the database path does not, it is still used, with a `RuntimeWarning`; move
+or rename it to the database path to give each database its own storage.
 
 ### Transactions
 
@@ -376,14 +425,29 @@ database. Connections to the same database directory in one process share
 the engine; while one of them has a transaction open, the others wait up to
 `timeout` seconds and then raise `OperationalError: database is locked`.
 
+### DB-API attributes
+
+As in `sqlite3`: the module globals `apilevel` (`'2.0'`), `threadsafety`
+(`1`: threads may share the module, not a connection) and `paramstyle`
+(`'qmark'`; `:name`, `?NNN`, `@name` and `$name` work too), and
+`Connection.total_changes`, the number of rows inserted, updated or deleted
+through the connection since it was opened.
+
 ### Known differences from sqlite3
 
 - Two result columns with the same name (`SELECT 1 AS a, 2 AS a`) collapse to
   one in embedded mode (the binding returns rows as dicts).
 - `REAL` columns created by other tools as 4-byte `float4` return the
   shortest decimal that round-trips (`0.1`), not the widened double.
-- After explicit ids, `AUTOINCREMENT` keys continue from their own sequence
-  rather than from the largest id in the table.
+- Automatic `INTEGER PRIMARY KEY` values never reuse a key, even after the
+  row with the largest key is deleted (SQLite without `AUTOINCREMENT` may
+  reuse it). Keys written by another client directly (not through this
+  layer) can make a later automatic key collide.
+- Tables created before 3.1.0 with `INTEGER PRIMARY KEY` use the engine's
+  `AUTOINCREMENT` counter, which does not move past explicit ids. Recreate
+  such tables (`CREATE TABLE new ... ; INSERT INTO new SELECT * FROM old`)
+  to get the behaviour above.
+- Columns without a type (`CREATE TABLE t (a, b)`) are not accepted.
 - SQLite-specific functions such as `typeof()` are not available.
 
 ### Exception Handling
