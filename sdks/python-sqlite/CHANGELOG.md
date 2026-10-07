@@ -74,6 +74,35 @@ All notable changes to `heliosdb-sqlite` are listed here.
 - `INSERT ... SELECT` into a table with an integer primary key no longer fails
   with a parse error (no `RETURNING` is appended to it; `lastrowid` is
   `None`).
+- Embedded mode returns every result column when several share a name: joins
+  with `SELECT *` or `p.id, k.id`, and repeated expressions such as
+  `count(*), count(name)` or `SELECT 1, 1, 2`. The binding returns rows as
+  dicts, so the later column silently replaced the earlier one and positional
+  access read the wrong column. Such columns now get unique aliases.
+- `cursor.description` / `Row.keys()` use `sqlite3`'s names in both modes:
+  aliases, declared column names in their declared case (`Id`, not `id`), and
+  expression text as written (`count(*)`, not `count`).
+- `PARSE_DECLTYPES` picks the converter by the column a result column comes
+  from, in both modes. It matched result names against table columns, so
+  `SELECT 'notadate' AS d` raised `ValueError` in the `date` converter and
+  `SELECT d AS name` returned `str`.
+- Embedded mode returns `sum()` over `REAL` / `DOUBLE PRECISION` columns (and
+  other numeric expressions the binding hands back as text) as `float`, not
+  `str`.
+- `total()` works (HeliosDB has none) and `group_concat()` over no non-NULL
+  values returns `NULL`, as in SQLite, in both modes.
+- `ORDER BY t.col` / `ORDER BY <n>` in joins sort the rows; HeliosDB Nano
+  ignored them there (both modes).
+- `cursor.lastrowid` follows `sqlite3`: it is set after every `execute()` to
+  the connection's last inserted key, so it survives an `UPDATE` and a new
+  cursor sees it. It is `None` after an insert into a table without an integer
+  primary key (HeliosDB has no implicit rowid; documented).
+- Embedded mode: `INTEGER PRIMARY KEY` keys stay correct with several
+  databases open in one process. heliosdb-nano-embedded 4.31.1 keeps sequence
+  state per process, so opening a second database reset the first one's key
+  sequence (the next automatic key was `1` again).
+- Daemon mode returns `VECTOR` columns as lists of floats, as embedded mode
+  does (the server sends them as text).
 
 ### Added
 

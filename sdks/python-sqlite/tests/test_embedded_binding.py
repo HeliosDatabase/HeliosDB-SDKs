@@ -215,3 +215,51 @@ def test_lastrowid_and_executemany_batch():
         assert conn.execute('SELECT max(id) FROM t').fetchone() == (3,)
     finally:
         conn.close()
+
+
+def test_parse_select_items_and_tables():
+    sql = ('SELECT p.id, k.id AS kid, count(*) n, sum(a)/2, "Name", x.*, * '
+           'FROM p JOIN k ON k.pid = p.id, "Q" AS x WHERE 1 ORDER BY 1')
+    shape = _sql.parse_select(sql)
+    kinds = [(i.kind, i.alias, i.qualifier, i.column) for i in shape.items]
+    assert kinds == [
+        ('column', None, 'p', 'id'),
+        ('column', 'kid', 'k', 'id'),
+        ('expr', 'n', None, None),
+        ('expr', None, None, None),
+        ('column', None, None, 'Name'),
+        ('star', None, 'x', None),
+        ('star', None, None, None),
+    ]
+    assert sql[shape.items[3].expr_start:shape.items[3].expr_end] == 'sum(a)/2'
+    assert [(t.name, t.alias) for t in shape.tables] == [('p', 'p'), ('k', 'k'), ('Q', 'x')]
+    assert shape.star_safe and not shape.compound and not shape.distinct
+
+
+def test_parse_select_edge_cases():
+    assert _sql.parse_select('INSERT INTO t VALUES (1)') is None
+    shape = _sql.parse_select('WITH c AS (SELECT 1) SELECT c.*, s.a FROM c, (SELECT 1 a) s')
+    assert [t.name for t in shape.tables] == [None, None]
+    shape = _sql.parse_select("SELECT DISTINCT a COLLATE nocase, DATE '2020-01-01' "
+                              "FROM t NATURAL JOIN u UNION SELECT 1, 2")
+    assert [i.kind for i in shape.items] == ['expr', 'expr']
+    assert shape.distinct and shape.compound and not shape.star_safe
+
+
+def test_rewrite_sqlite_aggregates():
+    sql = ("SELECT total(a), group_concat(DISTINCT s), group_concat(s, '|'), "
+           "sum(x) OVER (), total(a) OVER (w), 'total(a)' FROM t")
+    assert _sql.rewrite_sqlite_aggregates(sql) == (
+        "SELECT COALESCE(CAST(sum(a) AS DOUBLE PRECISION), 0.0), "
+        "CASE WHEN count(s) = 0 THEN NULL ELSE group_concat(DISTINCT s) END, "
+        "CASE WHEN count(s) = 0 THEN NULL ELSE group_concat(s, '|') END, "
+        "sum(x) OVER (), total(a) OVER (w), 'total(a)' FROM t")
+    assert _sql.rewrite_sqlite_aggregates('SELECT t.total FROM t') == 'SELECT t.total FROM t'
+
+
+def test_parse_order_by():
+    terms = _sql.parse_order_by('SELECT a FROM t ORDER BY t.a DESC, 2, b NULLS LAST, a + 1 LIMIT 3')
+    assert [(t.kind, t.qualifier, t.column, t.position) for t in terms] == [
+        ('column', 't', 'a', None), ('position', None, None, 2),
+        ('column', None, 'b', None), ('other', None, None, None)]
+    assert _sql.parse_order_by('SELECT a FROM t') is None

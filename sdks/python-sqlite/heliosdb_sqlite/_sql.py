@@ -35,6 +35,9 @@ __all__ = [
     'parse_alter_table',
     'rowid_sequence_name',
     'identifier_name',
+    'tokens',
+    'parse_select',
+    'rewrite_sqlite_aggregates',
 ]
 
 
@@ -304,6 +307,7 @@ class _ColumnDef(NamedTuple):
     type_name: str          # upper-cased type words without arguments
     type_start: int
     rest_start: int
+    written: str = ''       # the name as written, without quotes
 
 
 def _parse_column_def(text: str) -> Optional[_ColumnDef]:
@@ -322,8 +326,9 @@ def _parse_column_def(text: str) -> Optional[_ColumnDef]:
         words.append(w.group(1).upper())
         pos = type_end = w.end()
     name = identifier_name(m.group(1))
+    written = _strip_quotes(m.group(1))
     if type_start is None:
-        return _ColumnDef(name, '', '', m.end(), m.end())
+        return _ColumnDef(name, '', '', m.end(), m.end(), written)
     # Skip type arguments, e.g. DECIMAL(10, 2) or VARCHAR(20), and [] suffixes
     rest_start = type_end
     after = text[type_end:]
@@ -335,7 +340,14 @@ def _parse_column_def(text: str) -> Optional[_ColumnDef]:
     while text[rest_start:].lstrip().startswith('[]'):
         rest_start = text.index('[]', rest_start) + 2
     return _ColumnDef(name, text[type_start:rest_start].strip(), ' '.join(words),
-                      type_start, rest_start)
+                      type_start, rest_start, written)
+
+
+def _strip_quotes(ident: str) -> str:
+    ident = ident.strip()
+    if len(ident) >= 2 and ident[0] in '"`[' and ident[-1] in '"`]':
+        return ident[1:-1]
+    return ident
 
 
 def _affinity_type(type_name: str) -> str:
@@ -385,7 +397,7 @@ def _rewrite_column_def(text: str, rowid_default: Optional[str] = None) -> str:
 class CreateTable(NamedTuple):
     table: str                         # engine name of the table
     if_not_exists: bool
-    columns: List[Tuple[str, str]]     # (engine column name, declared type)
+    columns: List[Tuple[str, str, str]]  # (engine column name, declared type, name as written)
     rowid_column: Optional[str]        # the INTEGER PRIMARY KEY column
 
 
@@ -412,7 +424,7 @@ def parse_create_table(sql: str) -> Optional[CreateTable]:
         return None
     m, open_pos, close, bounds = parts
     table = identifier_name(m.group('n2') or m.group('n1'))
-    columns: List[Tuple[str, str]] = []
+    columns: List[Tuple[str, str, str]] = []
     rowid = None
     int_columns = {}
     table_pk: List[str] = []
@@ -425,7 +437,7 @@ def parse_create_table(sql: str) -> Optional[CreateTable]:
         col = _parse_column_def(text)
         if col is None:
             continue
-        columns.append((col.name, col.decltype))
+        columns.append((col.name, col.decltype, col.written))
         if col.type_name in ('INT', 'INTEGER'):
             int_columns[col.name] = True
             if rowid is None and _PRIMARY_KEY_RE.search(text[col.rest_start:]):
@@ -567,7 +579,8 @@ _ADD_COLUMN_RE = re.compile(r'ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(.*)$
 def parse_alter_table(sql: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     """``(table, action, args)`` for the ALTER TABLE forms that change
     declared column types: ('rename_table', (new,)), ('rename_column',
-    (old, new)), ('drop_column', (name,)), ('add_column', (name, decltype))."""
+    (old, new, new as written)), ('drop_column', (name,)),
+    ('add_column', (name, decltype, name as written))."""
     if first_keyword(sql) != 'ALTER':
         return None
     m = _ALTER_RE.match(sql)
@@ -580,7 +593,8 @@ def parse_alter_table(sql: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
         return table, 'rename_table', (identifier_name(r.group(1)),)
     r = _RENAME_COLUMN_RE.match(action)
     if r:
-        return table, 'rename_column', (identifier_name(r.group(1)), identifier_name(r.group(2)))
+        return table, 'rename_column', (identifier_name(r.group(1)), identifier_name(r.group(2)),
+                                        _strip_quotes(r.group(2)))
     r = _DROP_COLUMN_RE.match(action)
     if r:
         return table, 'drop_column', (identifier_name(r.group(1)),)
@@ -588,7 +602,7 @@ def parse_alter_table(sql: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     if r:
         col = _parse_column_def(r.group(1))
         if col is not None:
-            return table, 'add_column', (col.name, col.decltype)
+            return table, 'add_column', (col.name, col.decltype, col.written)
     return None
 
 
@@ -631,3 +645,525 @@ def referenced_tables(sql: str) -> List[str]:
             if name and name not in tables:
                 tables.append(name)
     return tables
+
+
+# --------------------------------------------------------------------------
+# Result columns of a SELECT: names, sources and unique-alias rewriting
+# --------------------------------------------------------------------------
+#
+# sqlite3 names a result column, and picks its declared type
+# (sqlite3_column_decltype, used by PARSE_DECLTYPES), from the select-list
+# item it comes from:
+#
+#   ``expr AS alias``        -> the alias as written
+#   ``col`` / ``t.col``      -> the column's name as declared in CREATE TABLE;
+#                               declared type of that column, also when aliased
+#   ``*`` / ``t.*``          -> every column of the table(s), declared names
+#   any other expression     -> its text as written (``count(*)``,
+#                               ``sum(a)/2``); no declared type
+#
+# HeliosDB names expression columns differently (``count``, ``sum / 2``) and
+# folds unquoted names to lower case, and the in-process binding returns
+# each row as a dict, which keeps only one of several columns with the same
+# name. ``parse_select`` describes the select list so the caller can report
+# sqlite3's names and declared types, and ``alias_select_items`` gives the
+# columns that would collide unique names.
+
+class Token(NamedTuple):
+    kind: str    # word | ident | string | number | param | group | op
+    text: str
+    start: int
+    end: int
+
+
+# Words that end a clause of a SELECT at the top level.
+_CLAUSE_WORDS = frozenset((
+    'FROM', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET', 'WINDOW',
+    'UNION', 'INTERSECT', 'EXCEPT', 'FETCH', 'FOR', 'INTO', 'RETURNING', 'QUALIFY',
+))
+_SET_OPERATORS = frozenset(('UNION', 'INTERSECT', 'EXCEPT'))
+# Words that cannot be an implicit alias, or a bare column name.
+_RESERVED = frozenset((
+    'ALL', 'AND', 'ANY', 'ARRAY', 'AS', 'ASC', 'BETWEEN', 'BY', 'CASE', 'CAST', 'COLLATE',
+    'CROSS', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP', 'DEFAULT', 'DESC',
+    'DISTINCT', 'ELSE', 'END', 'ESCAPE', 'EXISTS', 'FALSE', 'FILTER', 'FULL', 'GLOB', 'ILIKE',
+    'IN', 'INNER', 'INTERVAL', 'IS', 'ISNULL', 'JOIN', 'LATERAL', 'LEFT', 'LIKE',
+    'LOCALTIME', 'LOCALTIMESTAMP', 'MATCH', 'NATURAL', 'NOT', 'NOTNULL', 'NULL', 'ON',
+    'OR', 'OUTER', 'OVER', 'REGEXP', 'RIGHT', 'SELECT', 'SIMILAR', 'SOME', 'THEN', 'TRUE',
+    'USING', 'WHEN', 'WITH',
+)) | _CLAUSE_WORDS
+_JOIN_WORDS = frozenset(('JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
+                         'NATURAL', 'ON', 'USING', 'LATERAL'))
+_MULTI_OPS = ('->>', '::', '||', '<=', '>=', '<>', '!=', '==', '->', '<<', '>>')
+
+
+def tokens(sql: str, start: int = 0, end: Optional[int] = None) -> List[Token]:
+    """Top-level tokens of ``sql[start:end]``. A parenthesised part is one
+    ``group`` token; comments are skipped."""
+    n = len(sql) if end is None else end
+    out: List[Token] = []
+    i = start
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif sql.startswith('--', i):
+            nl = sql.find('\n', i)
+            i = n if nl < 0 or nl > n else nl + 1
+        elif sql.startswith('/*', i):
+            close = sql.find('*/', i + 2)
+            i = n if close < 0 else close + 2
+        elif ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(Token('string', sql[i:j + 1], i, min(j + 1, n)))
+            i = j + 1
+        elif ch in '"`' or (ch == '[' and not _subscript_context(out)):
+            close_ch = ']' if ch == '[' else ch
+            j = i + 1
+            while j < n:
+                if sql[j] == close_ch:
+                    if close_ch != ']' and j + 1 < n and sql[j + 1] == close_ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(Token('ident', sql[i:j + 1], i, min(j + 1, n)))
+            i = j + 1
+        elif ch == '(' or ch == '[':
+            close = _matching_bracket(sql, i, n)
+            if close < 0:
+                close = n - 1
+            out.append(Token('group', sql[i:close + 1], i, close + 1))
+            i = close + 1
+        elif ch.isdigit() or (ch == '.' and i + 1 < n and sql[i + 1].isdigit()):
+            m = _NUMBER_RE.match(sql, i, n)
+            j = m.end() if m else i + 1
+            out.append(Token('number', sql[i:j], i, j))
+            i = j
+        elif ch == '?' or (ch in ':@$' and i + 1 < n and (sql[i + 1].isalnum() or sql[i + 1] == '_')
+                           and not sql.startswith('::', i)):
+            m = _PARAM_RE.match(sql, i, n)
+            j = m.end() if m else i + 1
+            out.append(Token('param', sql[i:j], i, j))
+            i = j
+        elif ch.isalpha() or ch == '_' or ord(ch) > 127:
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] in '_$' or ord(sql[j]) > 127):
+                j += 1
+            out.append(Token('word', sql[i:j], i, j))
+            i = j
+        else:
+            for op in _MULTI_OPS:
+                if sql.startswith(op, i):
+                    out.append(Token('op', op, i, i + len(op)))
+                    i += len(op)
+                    break
+            else:
+                out.append(Token('op', ch, i, i + 1))
+                i += 1
+    return out
+
+
+_NUMBER_RE = re.compile(r'0[xX][0-9A-Fa-f]+|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
+_PARAM_RE = re.compile(r'\?\d*|[:@$][A-Za-z0-9_]+')
+
+
+def _subscript_context(prev: List[Token]) -> bool:
+    """A '[' after an expression (or ARRAY) is a subscript / array literal;
+    anywhere else it is SQLite's [quoted identifier]."""
+    if not prev:
+        return False
+    last = prev[-1]
+    if last.kind in ('ident', 'group', 'string'):
+        return True
+    return last.kind == 'word' and (last.text.upper() == 'ARRAY'
+                                    or last.text.upper() not in _RESERVED)
+
+
+def _matching_bracket(sql: str, open_pos: int, end: int) -> int:
+    """Index of the bracket closing the '(' or '[' at ``open_pos``."""
+    depth = 0
+    i = open_pos
+    while i < end:
+        ch = sql[i]
+        if ch in "'\"`":
+            close = sql.find(ch, i + 1)
+            while close >= 0 and close + 1 < end and sql[close + 1] == ch:
+                close = sql.find(ch, close + 2)
+            if close < 0:
+                return -1
+            i = close + 1
+            continue
+        if sql.startswith('--', i):
+            nl = sql.find('\n', i)
+            i = end if nl < 0 else nl + 1
+            continue
+        if sql.startswith('/*', i):
+            close = sql.find('*/', i + 2)
+            i = end if close < 0 else close + 2
+            continue
+        if ch in '([':
+            depth += 1
+        elif ch in ')]':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _is_word(tok: Token, *words: str) -> bool:
+    return tok.kind == 'word' and tok.text.upper() in words
+
+
+def _name_token(tok: Token) -> bool:
+    return tok.kind == 'ident' or (tok.kind == 'word' and tok.text.upper() not in _RESERVED)
+
+
+def _unquote(tok: Token) -> str:
+    """An identifier as written, without its quotes."""
+    text = tok.text
+    if tok.kind == 'ident' and len(text) >= 2:
+        inner = text[1:-1]
+        if text[0] in '"`':
+            inner = inner.replace(text[0] * 2, text[0])
+        return inner
+    return text
+
+
+def _fold(tok: Token) -> str:
+    """The name the engine uses for an identifier token."""
+    return _unquote(tok) if tok.kind == 'ident' else tok.text.lower()
+
+
+class SelectItem(NamedTuple):
+    start: int                  # span of the whole item, alias included
+    end: int
+    expr_start: int             # span of the expression without its alias
+    expr_end: int
+    alias: Optional[str]        # alias as written (unquoted)
+    kind: str                   # 'star' | 'column' | 'expr'
+    qualifier: Optional[str]    # engine name of the table qualifier
+    column: Optional[str]       # engine name of the column ('column' items)
+    written: Optional[str]      # the column name as written, unquoted
+
+
+class FromTable(NamedTuple):
+    name: Optional[str]         # engine table name; None for a subquery, CTE, function
+    alias: str                  # engine name the query refers to it by
+
+
+class SelectShape(NamedTuple):
+    items: List[SelectItem]
+    tables: List[FromTable]
+    star_safe: bool             # no NATURAL / USING joins (they merge columns)
+    compound: bool              # UNION / INTERSECT / EXCEPT
+    distinct: bool = False      # SELECT DISTINCT
+    list_end: int = 0           # end of the select list
+
+
+def parse_select(sql: str) -> Optional[SelectShape]:
+    """The select list and FROM tables of a ``SELECT`` (optionally after
+    ``WITH``), or None when the statement is not one this can describe."""
+    toks = tokens(sql)
+    i = 0
+    ctes = set()
+    if toks and _is_word(toks[0], 'WITH'):
+        i = 1
+        if i < len(toks) and _is_word(toks[i], 'RECURSIVE'):
+            i += 1
+        while i < len(toks):
+            if not _name_token(toks[i]) and toks[i].kind != 'word':
+                return None
+            ctes.add(_fold(toks[i]))
+            i += 1
+            if i < len(toks) and toks[i].kind == 'group':
+                i += 1
+            if i >= len(toks) or not _is_word(toks[i], 'AS'):
+                return None
+            i += 1
+            while i < len(toks) and _is_word(toks[i], 'NOT', 'MATERIALIZED'):
+                i += 1
+            if i >= len(toks) or toks[i].kind != 'group':
+                return None
+            i += 1
+            if i < len(toks) and toks[i].kind == 'op' and toks[i].text == ',':
+                i += 1
+                continue
+            break
+    if i >= len(toks) or not _is_word(toks[i], 'SELECT'):
+        return None
+    i += 1
+    distinct = False
+    if i < len(toks) and _is_word(toks[i], 'ALL'):
+        i += 1
+    elif i < len(toks) and _is_word(toks[i], 'DISTINCT'):
+        distinct = True
+        i += 1
+        if i < len(toks) and _is_word(toks[i], 'ON'):
+            i += 2
+    # select list
+    items: List[SelectItem] = []
+    current: List[Token] = []
+    while i < len(toks):
+        tok = toks[i]
+        if tok.kind == 'word' and tok.text.upper() in _CLAUSE_WORDS:
+            break
+        if tok.kind == 'op' and tok.text == ';':
+            break
+        if tok.kind == 'op' and tok.text == ',':
+            item = _select_item(current)
+            if item is None:
+                return None
+            items.append(item)
+            current = []
+        else:
+            current.append(tok)
+        i += 1
+    item = _select_item(current)
+    if item is None:
+        return None
+    items.append(item)
+    list_end = item.end
+    # FROM
+    tables: List[FromTable] = []
+    star_safe = True
+    if i < len(toks) and _is_word(toks[i], 'FROM'):
+        i += 1
+        from_toks = []
+        while i < len(toks):
+            tok = toks[i]
+            if (tok.kind == 'word' and tok.text.upper() in _CLAUSE_WORDS) or \
+                    (tok.kind == 'op' and tok.text == ';'):
+                break
+            from_toks.append(tok)
+            i += 1
+        parsed = _from_tables(from_toks, ctes)
+        if parsed is None:
+            return None
+        tables, star_safe = parsed
+    compound = any(t.kind == 'word' and t.text.upper() in _SET_OPERATORS for t in toks[i:])
+    return SelectShape(items, tables, star_safe, compound, distinct, list_end)
+
+
+def _select_item(toks: List[Token]) -> Optional[SelectItem]:
+    if not toks:
+        return None
+    alias = None
+    expr = toks
+    if len(toks) >= 3 and _is_word(toks[-2], 'AS') and toks[-1].kind in ('word', 'ident'):
+        alias = _unquote(toks[-1])
+        expr = toks[:-2]
+    elif len(toks) >= 2 and _name_token(toks[-1]):
+        prev = toks[-2]
+        if prev.kind in ('ident', 'group', 'string', 'number', 'param') or \
+                (prev.kind == 'word' and prev.text.upper() not in _RESERVED):
+            # 'count(*) n', 'a b'; but not 'x COLLATE nocase', 'DATE '...''
+            if not (prev.kind == 'word' and _is_word(prev, 'COLLATE')):
+                alias = _unquote(toks[-1])
+                expr = toks[:-1]
+    start, end = toks[0].start, toks[-1].end
+    estart, eend = expr[0].start, expr[-1].end
+    # star / column reference: name ( . name ){0,2} ( . * )?
+    names: List[Token] = []
+    star = False
+    ok = True
+    for pos, tok in enumerate(expr):
+        if pos % 2 == 1:
+            if not (tok.kind == 'op' and tok.text == '.'):
+                ok = False
+                break
+        elif tok.kind == 'op' and tok.text == '*' and pos == len(expr) - 1:
+            star = True
+        elif _name_token(tok) and not star:
+            names.append(tok)
+        else:
+            ok = False
+            break
+    if ok and len(expr) % 2 == 1:
+        if star and alias is None and len(names) <= 2:
+            qualifier = _fold(names[-1]) if names else None
+            return SelectItem(start, end, estart, eend, None, 'star', qualifier, None, None)
+        if not star and 1 <= len(names) <= 3:
+            qualifier = _fold(names[-2]) if len(names) >= 2 else None
+            return SelectItem(start, end, estart, eend, alias, 'column', qualifier,
+                              _fold(names[-1]), _unquote(names[-1]))
+    return SelectItem(start, end, estart, eend, alias, 'expr', None, None, None)
+
+
+def _from_tables(toks: List[Token], ctes) -> Optional[Tuple[List[FromTable], bool]]:
+    tables: List[FromTable] = []
+    star_safe = True
+    expect = True
+    i = 0
+    n = len(toks)
+    while i < n:
+        tok = toks[i]
+        if expect:
+            if _is_word(tok, 'LATERAL', 'ONLY'):
+                i += 1
+                continue
+            name: Optional[str] = None
+            alias: Optional[str] = None
+            if tok.kind == 'group':
+                i += 1
+            elif _name_token(tok):
+                parts = [tok]
+                i += 1
+                while i + 1 < n and toks[i].kind == 'op' and toks[i].text == '.' \
+                        and toks[i + 1].kind in ('word', 'ident'):
+                    parts.append(toks[i + 1])
+                    i += 2
+                if i < n and toks[i].kind == 'group':
+                    i += 1          # table-valued function
+                else:
+                    name = _fold(parts[-1])
+                    alias = name
+                    if name in ctes:
+                        name = None
+            else:
+                return None
+            if i < n and _is_word(toks[i], 'AS'):
+                i += 1
+            if i < n and _name_token(toks[i]) and toks[i].text.upper() not in _JOIN_WORDS:
+                alias = _fold(toks[i])
+                i += 1
+                if i < n and toks[i].kind == 'group':
+                    star_safe = False   # column aliases: names unknown
+                    name = None
+                    i += 1
+            tables.append(FromTable(name, alias or ''))
+            expect = False
+            continue
+        if tok.kind == 'op' and tok.text == ',':
+            expect = True
+        elif _is_word(tok, 'JOIN'):
+            expect = True
+        elif _is_word(tok, 'NATURAL', 'USING'):
+            star_safe = False
+        i += 1
+    return tables, star_safe
+
+
+# --------------------------------------------------------------------------
+# SQLite aggregates the engine lacks or answers differently
+# --------------------------------------------------------------------------
+
+_SQLITE_AGG_RE = re.compile(r'(?<![\w.$"])(total|group_concat)\s*\(', re.IGNORECASE)
+_FOLLOWING_RE = re.compile(r'\s*(OVER|FILTER)\b', re.IGNORECASE)
+_DISTINCT_RE = re.compile(r'\s*DISTINCT\b', re.IGNORECASE)
+_ORDER_BY_RE = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
+
+
+def rewrite_sqlite_aggregates(sql: str) -> str:
+    """``total(x)`` -> ``COALESCE(CAST(sum(x) AS DOUBLE PRECISION), 0.0)``
+    (the engine has no total(); SQLite's is a float that is 0.0 for no
+    rows), and ``group_concat(x[, sep])`` -> NULL when no non-NULL ``x``
+    was aggregated, as in SQLite (the engine returns ''). Window and
+    FILTER uses are left alone."""
+    lower = sql.lower()
+    if 'total' not in lower and 'group_concat' not in lower:
+        return sql
+    out = []
+    pos = 0
+    for start, end in code_spans(sql):
+        if start < pos:
+            start = pos
+        for m in _SQLITE_AGG_RE.finditer(sql, start, end):
+            if m.start() < pos:
+                continue
+            open_pos = m.end() - 1
+            close = _matching_paren(sql, open_pos)
+            if close < 0 or _FOLLOWING_RE.match(sql, close + 1):
+                continue
+            inner = rewrite_sqlite_aggregates(sql[open_pos + 1:close])
+            name = m.group(1).lower()
+            if name == 'total':
+                if _top_level_commas(inner, 0, len(inner)):
+                    continue
+                replacement = f'COALESCE(CAST(sum({inner}) AS DOUBLE PRECISION), 0.0)'
+            else:
+                commas = _top_level_commas(inner, 0, len(inner))
+                first = inner[:commas[0]] if commas else inner
+                order = _ORDER_BY_RE.search(first)
+                if order:
+                    first = first[:order.start()]
+                d = _DISTINCT_RE.match(first)
+                if d:
+                    first = first[d.end():]
+                if not first.strip():
+                    continue
+                replacement = (f'CASE WHEN count({first.strip()}) = 0 THEN NULL '
+                               f'ELSE {sql[m.start():open_pos]}({inner}) END')
+            out.append(sql[pos:m.start()])
+            out.append(replacement)
+            pos = close + 1
+    if not out:
+        return sql
+    out.append(sql[pos:])
+    return ''.join(out)
+
+
+class OrderTerm(NamedTuple):
+    start: int                  # span of the sort expression (without ASC/DESC/...)
+    end: int
+    kind: str                   # 'column' | 'position' | 'other'
+    qualifier: Optional[str]    # engine name ('column' terms)
+    column: Optional[str]       # engine name ('column' terms)
+    position: Optional[int]     # 1-based ('position' terms)
+
+
+_ORDER_END_WORDS = frozenset(('LIMIT', 'OFFSET', 'FETCH', 'FOR'))
+_ORDER_MODIFIERS = frozenset(('ASC', 'DESC', 'NULLS', 'FIRST', 'LAST'))
+
+
+def parse_order_by(sql: str) -> Optional[List[OrderTerm]]:
+    """The terms of a SELECT's top-level ``ORDER BY`` (None if it has none)."""
+    toks = tokens(sql)
+    start = None
+    for i in range(len(toks) - 1):
+        if _is_word(toks[i], 'ORDER') and _is_word(toks[i + 1], 'BY'):
+            start = i + 2
+    if start is None:
+        return None
+    terms: List[OrderTerm] = []
+    current: List[Token] = []
+
+    def close_term() -> bool:
+        body = list(current)
+        while body and body[-1].kind == 'word' and body[-1].text.upper() in _ORDER_MODIFIERS:
+            body.pop()
+        if not body:
+            return False
+        s, e = body[0].start, body[-1].end
+        if len(body) == 1 and body[0].kind == 'number' and body[0].text.isdigit():
+            terms.append(OrderTerm(s, e, 'position', None, None, int(body[0].text)))
+        elif (len(body) == 3 and _name_token(body[0]) and body[1].kind == 'op'
+              and body[1].text == '.' and _name_token(body[2])):
+            terms.append(OrderTerm(s, e, 'column', _fold(body[0]), _fold(body[2]), None))
+        elif len(body) == 1 and _name_token(body[0]):
+            terms.append(OrderTerm(s, e, 'column', None, _fold(body[0]), None))
+        else:
+            terms.append(OrderTerm(s, e, 'other', None, None, None))
+        return True
+
+    for tok in toks[start:]:
+        if (tok.kind == 'word' and tok.text.upper() in _ORDER_END_WORDS) or \
+                (tok.kind == 'op' and tok.text == ';'):
+            break
+        if tok.kind == 'op' and tok.text == ',':
+            if not close_term():
+                return None
+            current = []
+        else:
+            current.append(tok)
+    if not close_term():
+        return None
+    return terms

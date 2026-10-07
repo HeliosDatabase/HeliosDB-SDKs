@@ -124,6 +124,13 @@ class _Handle:
 _HANDLES: Dict[str, _Handle] = {}
 _HANDLES_LOCK = threading.Lock()
 
+# heliosdb-nano-embedded 4.31.1 keeps sequence state per process, by name,
+# not per database: opening another database resets it, and two databases
+# with a sequence of the same name share one counter. The handle that last
+# used (and resynchronised) each rowid sequence; opening a database clears
+# the map, so every sequence is resynchronised before its next use.
+_SEQUENCE_OWNERS: Dict[str, int] = {}
+
 
 class EmbeddedBackend:
     """One sqlite3 Connection's view of an in-process Nano database."""
@@ -133,11 +140,15 @@ class EmbeddedBackend:
         self._timeout = timeout
         self._owner = False   # holds the handle's write lock (open transaction)
         self._columns_cache: Dict[str, Dict[str, str]] = {}
+        # result types of expression columns, by statement (see _expression_types)
+        self._expr_types_cache: Dict[str, Dict[int, Optional[str]]] = {}
         if path is None:
             # sqlite3 ':memory:': a private database per Connection.
             self._key = None
             self._handle = _Handle(module.EmbeddedDatabase.in_memory())
             self._handle.refs = 1
+            with _HANDLES_LOCK:
+                _SEQUENCE_OWNERS.clear()
         else:
             key = os.path.abspath(path)
             with _HANDLES_LOCK:
@@ -146,6 +157,7 @@ class EmbeddedBackend:
                     os.makedirs(os.path.dirname(key) or '.', exist_ok=True)
                     handle = _Handle(module.EmbeddedDatabase(key))
                     _HANDLES[key] = handle
+                    _SEQUENCE_OWNERS.clear()
                 handle.refs += 1
             self._key = key
             self._handle = handle
@@ -188,12 +200,28 @@ class EmbeddedBackend:
             self._owner = False
             self._handle.write_lock.release()
 
+    # -- sequences -----------------------------------------------------------
+
+    def claim_sequence(self, name: str) -> bool:
+        """Note that this database is about to draw from sequence ``name``.
+        True when the binding's process-wide state for it may be stale (see
+        _SEQUENCE_OWNERS) and the caller must resynchronise it first."""
+        handle = self._handle
+        if handle is None:
+            return False
+        with _HANDLES_LOCK:
+            stale = _SEQUENCE_OWNERS.get(name) != id(handle)
+            _SEQUENCE_OWNERS[name] = id(handle)
+        return stale
+
     # -- execution ---------------------------------------------------------
 
-    def run(self, sql: str, params: Sequence[Any] = ()) -> Union[Dict[str, Any], int]:
+    def run(self, sql: str, params: Sequence[Any] = (),
+            plan: Any = None) -> Union[Dict[str, Any], int]:
         """Execute one statement. Returns ``{'rows', 'columns', 'decl_oids'}``
         for a statement that produces rows, otherwise the affected-row count
-        (-1 when not applicable)."""
+        (-1 when not applicable). ``plan`` (main._ResultPlan) gives the
+        source table column of each result column of a SELECT."""
         keyword = _sql.first_keyword(sql)
         if keyword in ('BEGIN', 'START'):
             acquired = not self._owner
@@ -213,12 +241,12 @@ class EmbeddedBackend:
                 # succeed (a failed COMMIT rolls back).
                 self._release()
         if self._owner:
-            return self._run(keyword, sql, params)
+            return self._run(keyword, sql, params, plan)
         # Not in a transaction: wait for any other Connection's transaction
         # to finish, then run the statement on its own.
         self._acquire()
         try:
-            return self._run(keyword, sql, params)
+            return self._run(keyword, sql, params, plan)
         finally:
             self._release()
 
@@ -233,7 +261,8 @@ class EmbeddedBackend:
         finally:
             self._release()
 
-    def _run(self, keyword: str, sql: str, params: Sequence[Any]) -> Union[Dict[str, Any], int]:
+    def _run(self, keyword: str, sql: str, params: Sequence[Any],
+             plan: Any = None) -> Union[Dict[str, Any], int]:
         db = self._db()
         bound = list(params) if params else None
         if bound is None and keyword in _WRITE_KEYWORDS:
@@ -255,9 +284,16 @@ class EmbeddedBackend:
             else:
                 columns = self._empty_result_columns(keyword, sql, bound)
                 values = []
-            decl_oids = self._decl_oids(sql, columns)
+            planned = plan is not None and plan.width + plan.hidden == len(columns)
+            if planned:
+                decl_oids = self._source_oids(list(plan.sources) + [None] * plan.hidden)
+            else:
+                decl_oids = self._decl_oids(sql, columns)
+            rows_out = [_normalise_row(row, decl_oids) for row in values]
+            if planned and rows_out:
+                self._type_expressions(plan, bound, rows_out)
             return {
-                'rows': [_normalise_row(row, decl_oids) for row in values],
+                'rows': rows_out,
                 'columns': columns,
                 'decl_oids': decl_oids,
             }
@@ -308,6 +344,76 @@ class EmbeddedBackend:
                 columns[name.lower()] = _base_data_type(data_type)
         self._columns_cache[table] = columns
         return columns
+
+    def _source_oids(self, sources: List[Optional[Any]]) -> List[Optional[int]]:
+        """Type OID of each result column's source table column (None for
+        expressions)."""
+        out: List[Optional[int]] = []
+        for source in sources:
+            if source is None:
+                out.append(None)
+                continue
+            data_type = self._table_columns(source[0]).get(source[1].lower())
+            out.append(_DATA_TYPE_OIDS.get(data_type) if data_type else None)
+        return out
+
+    def _type_expressions(self, plan: Any, params: Optional[List[Any]],
+                          rows: List[List[Any]]) -> None:
+        """heliosdb-nano-embedded 4.31.1 returns NUMERIC values, and some
+        double precision results such as sum() over a DOUBLE PRECISION
+        column, as Python ``str``, indistinguishable from TEXT. For an
+        expression column holding such a string, ask the engine for the
+        column's type once per statement (pg_typeof over the query) and
+        convert: double precision / real -> float, numeric -> int or float
+        (SQLite NUMERIC affinity), integer types -> int."""
+        exprs = plan.expression_columns()
+        wanted = [i for i, is_expr in enumerate(exprs)
+                  if is_expr and any(isinstance(r[i], str) and _NUMBER_TEXT_RE.match(r[i])
+                                     for r in rows)]
+        if not wanted:
+            return
+        key = plan.sql
+        cached = self._expr_types_cache.get(key)
+        if cached is None or any(i not in cached for i in wanted):
+            cached = dict(cached or {})
+            cached.update(self._probe_types(plan, params, wanted))
+            if len(self._expr_types_cache) > 256:
+                self._expr_types_cache.clear()
+            self._expr_types_cache[key] = cached
+        for i in wanted:
+            convert = _PG_TYPE_CONVERTERS.get(cached.get(i) or '')
+            if convert is None:
+                continue
+            for row in rows:
+                value = row[i]
+                if isinstance(value, str):
+                    try:
+                        row[i] = convert(value)
+                    except (TypeError, ValueError, ArithmeticError):
+                        pass
+
+    def _probe_types(self, plan: Any, params: Optional[List[Any]],
+                     columns: List[int]) -> Dict[int, Optional[str]]:
+        found: Dict[int, Optional[str]] = {i: None for i in columns}
+        inner = plan.unique_sql(alias_all=True)
+        if inner is None:
+            return found
+        inner = _sql.rewrite_sqlite_aggregates(inner)
+        prefix = plan.UNIQUE_PREFIX
+        # Unqualified: 4.31.1 does not resolve _hq."x" on a derived table.
+        select = ', '.join(f'pg_typeof("{prefix}{i}") AS "_ht{i}"' for i in columns)
+        body = inner.strip()
+        while body.endswith(';'):
+            body = body[:-1].rstrip()
+        try:
+            rows = self._db().query(f'SELECT {select} FROM (\n{body}\n) AS _hq LIMIT 1', params)
+        except Exception:
+            return found
+        if rows:
+            for i in columns:
+                value = rows[0].get(f'_ht{i}')
+                found[i] = value.lower() if isinstance(value, str) else None
+        return found
 
     def _decl_oids(self, sql: str, columns: List[str]) -> List[Optional[int]]:
         """The declared type (as a type OID) of each result column that is a
@@ -469,6 +575,24 @@ def _normalise_row(row: List[Any], decl_oids: Optional[List[Optional[int]]]) -> 
         _normalise_value(v, decl_oids[i] if i < len(decl_oids) else None)
         for i, v in enumerate(row)
     ]
+
+
+_NUMBER_TEXT_RE = re.compile(r'^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$')
+
+_PG_TYPE_CONVERTERS = {
+    'double precision': float,
+    'float8': float,
+    'real': float,
+    'float4': float,
+    'numeric': _types._to_numeric,
+    'decimal': _types._to_numeric,
+    'bigint': int,
+    'integer': int,
+    'smallint': int,
+    'int8': int,
+    'int4': int,
+    'int2': int,
+}
 
 
 def converter_input(value: Any) -> bytes:

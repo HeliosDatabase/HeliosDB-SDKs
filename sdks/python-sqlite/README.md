@@ -256,8 +256,15 @@ for row in cursor:
 After an `INSERT ... VALUES` into a table whose primary key is an integer
 column (`INTEGER`, `BIGINT`, `SERIAL`, ...), `cursor.lastrowid` holds the key
 of the inserted row, as in `sqlite3`. For a multi-row `INSERT` it is the key
-of the last row. Tables without an integer primary key, and
-`INSERT ... SELECT`, leave it `None`.
+of the last row. As in `sqlite3`, `lastrowid` is set after every `execute()`
+to the connection's last inserted key (so it keeps that value after an
+`UPDATE` or `SELECT`, also on a new cursor), and `executemany()` leaves it
+unchanged.
+
+HeliosDB tables have no implicit `rowid`: after an `INSERT` into a table
+without an integer primary key, or an `INSERT ... SELECT`, `lastrowid` is
+`None` (`sqlite3` reports the rowid), and `SELECT rowid` / `oid` fail with
+`OperationalError`. Declare `id INTEGER PRIMARY KEY` where you need one.
 
 ```python
 cur.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
@@ -336,6 +343,34 @@ Converters receive the stored value's `bytes` (`b'1'` for a true
 `BOOLEAN`, `b'1.5'` for a `REAL`) and are never called for NULL.
 `register_adapter()` adapters apply to parameters, and
 `Connection.text_factory` to text values.
+
+The declared type follows the column a result column comes from, not the
+result column's name, as in `sqlite3`: `SELECT d AS name` gets the converter
+of `d`'s declared type, while `SELECT 'x' AS d` and `SELECT name AS d` do not
+get the one for the `d` column. Aggregates and other expressions get no
+converter.
+
+#### Column names and aggregates
+
+`cursor.description` and `Row.keys()` use the names `sqlite3` uses: the alias
+when there is one, the column's name as declared in `CREATE TABLE` for a
+column reference (`SELECT id` on a column declared `Id` gives `'Id'`; `*`
+gives every declared name), and the expression as written otherwise
+(`'count(*)'`, `'sum(a)/2'`). Every result column is returned, also when
+several share a name (`SELECT p.id, k.id ...`, `SELECT * FROM p JOIN k ...`,
+`SELECT count(*), count(name)`), so positional access reads the same column
+as in `sqlite3`.
+
+Aggregates return `sqlite3`'s types: `sum()` over `REAL` values is a
+`float`, over integers an `int`; `avg()` and `total()` are `float`.
+`total()` (which HeliosDB lacks) is provided, and `group_concat()` over no
+non-NULL values is `NULL`, as in SQLite.
+
+Names as declared are recorded in the `heliosdb_sqlite_decltypes` table with
+the declared types; for tables created without this layer (or before 3.1.0)
+the engine's lower-case names are reported. Quoted identifiers follow
+HeliosDB's rule: a name created as `"MiXed"` must be written `"MiXed"` in
+queries (SQLite matches it in any case).
 
 HeliosDB stores its own column types (`INTEGER` is created as `BIGINT`, see
 "SQLite schemas"), so this layer records each column's declared type when it
@@ -435,8 +470,29 @@ through the connection since it was opened.
 
 ### Known differences from sqlite3
 
-- Two result columns with the same name (`SELECT 1 AS a, 2 AS a`) collapse to
-  one in embedded mode (the binding returns rows as dicts).
+- Embedded mode (heliosdb-nano-embedded 4.31.1 returns rows as dicts): result
+  columns that share a name are told apart by giving them unique aliases.
+  When that is not possible (a `*` over a subquery or a `NATURAL` / `USING`
+  join whose columns collide), the merged result is returned with a
+  `RuntimeWarning`; give such columns distinct aliases.
+- Embedded mode: an expression whose value is a number held as text (a
+  `NUMERIC` result such as `sum()` over a `DOUBLE PRECISION` column) is typed
+  by asking the engine for the column's type once per statement text; the
+  first run of such a statement costs one extra query.
+- With HeliosDB Nano 4.41.0 and binding 4.31.1, `sum(x)` over no rows returns
+  `0` instead of `NULL` when the same query also uses `group_concat()` /
+  `string_agg()` (reported to the engine).
+- `ORDER BY t.col` and `ORDER BY <n>` in a query that joins tables are
+  rewritten to sort by select-list aliases, because HeliosDB Nano 4.41.0 and
+  binding 4.31.1 ignore them in joins (reported to the engine).
+  `SELECT DISTINCT` joins ordered by a column that is not selected are sent
+  as written and may come back unsorted.
+- A list or tuple of numbers binds as a HeliosDB `VECTOR` (`sqlite3` raises
+  `ProgrammingError`). `VECTOR` columns read back as lists of floats in both
+  modes; a list bound in a bare expression (`SELECT ?`) comes back as a list
+  in embedded mode and as text such as `'[1.0, 2.0]'` in daemon mode, where
+  the server reports such values as text.
+- No implicit `rowid` / `oid` (see `cursor.lastrowid`).
 - `REAL` columns created by other tools as 4-byte `float4` return the
   shortest decimal that round-trips (`0.1`), not the widened double.
 - Automatic `INTEGER PRIMARY KEY` values never reuse a key, even after the

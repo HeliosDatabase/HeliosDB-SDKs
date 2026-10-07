@@ -496,15 +496,52 @@ class Cursor:
             elif keyword in ('CREATE', 'DROP', 'ALTER'):
                 schema_state = conn._schema_before(user_sql, keyword)
 
-        if self._INSERT_RE.match(stmt):
-            self.lastrowid = None
+        is_insert = bool(self._INSERT_RE.match(stmt))
+        if is_insert and conn._sqlite_types:
+            conn._rowid_sync_for(stmt)
         stmt, lastrowid_pk = self._maybe_inject_returning(stmt)
 
+        # Result columns as sqlite3 names and types them, for SELECT.
+        plan = conn._result_plan(stmt) if keyword in ('SELECT', 'WITH') else None
+        run_stmt = stmt
+        if plan is not None:
+            fixed = plan.join_order_fix() if conn._sqlite_types else None
+            if fixed is not None:
+                run_stmt, plan.hidden = fixed
+            elif plan.collides and conn._backend is not None:
+                run_stmt = plan.unique_sql(alias_all=False) or stmt
+        if conn._sqlite_types:
+            run_stmt = _sql.rewrite_sqlite_aggregates(run_stmt)
+
         try:
-            if values is not None:
-                results = conn._execute_bound(stmt, values)
-            else:
-                results = conn._execute_sql(stmt)
+            try:
+                if values is not None:
+                    results = conn._execute_bound(run_stmt, values, plan)
+                else:
+                    results = conn._execute_sql(run_stmt)
+            except Error:
+                if plan is None or run_stmt == stmt:
+                    raise
+                # A rewrite the engine rejects: run the statement as written.
+                plan.hidden = 0
+                run_stmt = _sql.rewrite_sqlite_aggregates(stmt) if conn._sqlite_types else stmt
+                if values is not None:
+                    results = conn._execute_bound(run_stmt, values, plan)
+                else:
+                    results = conn._execute_sql(run_stmt)
+            if plan is not None and plan.hidden and isinstance(results, dict):
+                cut = plan.hidden
+                results['columns'] = list(results.get('columns') or [])[:-cut]
+                results['rows'] = [list(r)[:-cut] for r in results.get('rows') or []]
+                if results.get('types'):
+                    results['types'] = list(results['types'])[:-cut]
+                if results.get('decl_oids'):
+                    results['decl_oids'] = list(results['decl_oids'])[:-cut]
+            if (plan is not None and conn._backend is not None and isinstance(results, dict)
+                    and len(results.get('columns') or ()) != plan.width):
+                # The binding merged columns that share a name (it returns
+                # rows as dicts): run again with a unique name on each.
+                results = conn._rerun_unique(plan, values, results)
         except Error:
             raise
         except Exception as e:
@@ -521,14 +558,19 @@ class Cursor:
             # server's RowDescription (wire transport); 'decl_oids' marks a
             # typed result from the in-process binding.
             columns = results.get('columns', [])
+            if plan is not None and len(columns) != plan.width:
+                plan = None
             self._results = self._convert_rows(
                 results.get('rows', []), columns, results.get('types'),
-                results.get('decl_oids'), stmt,
+                results.get('decl_oids'), stmt, plan,
             )
+            if plan is not None and conn._backend is None and 'vector' in plan.udts:
+                _parse_vectors(self._results, plan.udts)
             self._result_index = 0
+            names = plan.labels if plan is not None else columns
             self.description = [
                 (self._column_name(col), None, None, None, None, None, None)
-                for col in columns
+                for col in names
             ] if columns else None
             self.rowcount = -1 if keyword in self._QUERY_KEYWORDS else len(self._results)
 
@@ -541,9 +583,9 @@ class Cursor:
                     pk_idx = columns.index(lastrowid_pk) if lastrowid_pk in columns else 0
                     if pk_idx < len(last_row):
                         try:
-                            self.lastrowid = int(last_row[pk_idx])
+                            conn._last_insert_rowid = int(last_row[pk_idx])
                         except (TypeError, ValueError):
-                            self.lastrowid = None
+                            pass
                 self._results = []
                 self._result_index = 0
                 self.description = None
@@ -556,6 +598,13 @@ class Cursor:
             self.rowcount = results if isinstance(results, int) else -1
         if keyword in self._DML_KEYWORDS and self.rowcount > 0:
             conn._total_changes += self.rowcount
+        if is_insert and not lastrowid_pk and self.rowcount > 0:
+            # A table without an INTEGER PRIMARY KEY: HeliosDB has no rowid
+            # to report, so the last inserted rowid is unknown.
+            conn._last_insert_rowid = None
+        # sqlite3 sets lastrowid after every execute() to the connection's
+        # last inserted rowid (sqlite3_last_insert_rowid).
+        self.lastrowid = conn._last_insert_rowid
 
     def executemany(self, sql: str, seq_of_parameters: Any) -> 'Cursor':
         """
@@ -600,6 +649,8 @@ class Cursor:
                 if conn.isolation_level is not None and not conn._in_transaction:
                     conn.begin()
                 for stmt_i, batch, plan in groups:
+                    if conn._sqlite_types and keyword in ('INSERT', 'REPLACE'):
+                        conn._rowid_sync_for(stmt_i)
                     total += conn._execute_bound_many(stmt_i, batch)
                     if plan is not None:
                         conn._rowid_after(plan)
@@ -767,6 +818,7 @@ class Cursor:
         type_oids: Optional[List[Optional[int]]],
         decl_oids: Optional[List[Optional[int]]] = None,
         sql: Optional[str] = None,
+        plan: Optional['_ResultPlan'] = None,
     ) -> List[List[Any]]:
         """Turn transport rows into sqlite3-typed rows.
 
@@ -791,11 +843,15 @@ class Cursor:
         converters: List[Optional[Callable]] = [None] * ncols
         if self.connection.detect_types and _converters:
             decltypes: List[Optional[str]] = [None] * ncols
-            if self.connection.detect_types & PARSE_DECLTYPES and sql:
+            if self.connection.detect_types & PARSE_DECLTYPES and plan is not None:
+                found = self.connection._plan_decltypes(plan)
+                decltypes = [found[i] if i < len(found) else None for i in range(ncols)]
+            elif self.connection.detect_types & PARSE_DECLTYPES and sql:
                 found = self.connection._result_decltypes(sql, columns)
                 decltypes = [found[i] if i < len(found) else None for i in range(ncols)]
+            names = plan.labels if plan is not None else columns
             converters = [
-                self._lookup_converter(columns[i] if i < len(columns) else None, oids[i],
+                self._lookup_converter(names[i] if i < len(names) else None, oids[i],
                                        decltypes[i])
                 for i in range(ncols)
             ]
@@ -986,6 +1042,21 @@ def _unsupported_parameter(value: Any, index: int) -> Exception:
     return InterfaceError(f"Error binding parameter {index - 1} - probably unsupported type.")
 
 
+def _parse_vectors(rows: List[List[Any]], udts: List[Optional[str]]) -> None:
+    """Daemon mode: the server sends VECTOR values as text ('[1.0,2.5]',
+    type OID 25); return them as lists of floats, as embedded mode does."""
+    cols = [i for i, udt in enumerate(udts) if udt == 'vector']
+    for row in rows:
+        for i in cols:
+            value = row[i] if i < len(row) else None
+            if isinstance(value, str) and value.startswith('[') and value.endswith(']'):
+                inner = value[1:-1].strip()
+                try:
+                    row[i] = [float(x) for x in inner.split(',')] if inner else []
+                except ValueError:
+                    pass
+
+
 def _is_vector(value: Any) -> bool:
     return isinstance(value, (list, tuple)) and bool(value) and all(
         isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)
@@ -1072,6 +1143,166 @@ def _adapt_native(value: Any, index: int) -> Any:
 # ============================================================================
 # CONNECTION CLASS - Main database interface
 # ============================================================================
+
+class _ResultPlan:
+    """sqlite3's view of a SELECT's result columns (see _sql.parse_select):
+    the name sqlite3 reports for each column, the table column it comes
+    from (for its declared type), and how to give every column a unique
+    name when the in-process binding would merge columns that share one."""
+
+    __slots__ = ('sql', 'shape', 'labels', 'sources', 'kinds', 'items', 'keys',
+                 'qualifiers', 'udts', 'width', 'collides', 'hidden')
+
+    UNIQUE_PREFIX = '_hc'
+
+    def __init__(self, sql: str, shape: '_sql.SelectShape'):
+        self.sql = sql
+        self.shape = shape
+        self.labels: List[str] = []
+        self.sources: List[Optional[Tuple[str, str]]] = []
+        self.kinds: List[str] = []          # 'column' | 'expr'
+        self.items: List[int] = []          # select-list item of each column
+        self.keys: List[Optional[str]] = [] # name the engine gives it, when known
+        self.qualifiers: List[Optional[str]] = []
+        self.udts: List[Optional[str]] = []  # source column's udt_name
+        self.width = 0
+        self.collides = False
+        # trailing columns added only to sort by (see join_order_fix)
+        self.hidden = 0
+
+    def add(self, label: str, source: Optional[Tuple[str, str]], kind: str, item: int,
+            key: Optional[str], qualifier: Optional[str] = None,
+            udt: Optional[str] = None) -> None:
+        self.labels.append(label)
+        self.sources.append(source)
+        self.kinds.append(kind)
+        self.items.append(item)
+        self.keys.append(key)
+        self.qualifiers.append(qualifier)
+        self.udts.append(udt)
+        self.width += 1
+
+    def finish(self) -> None:
+        seen = set()
+        for key in self.keys:
+            if key is None:
+                continue
+            folded = key.lower()
+            if folded in seen:
+                self.collides = True
+            seen.add(folded)
+
+    def expression_columns(self) -> List[bool]:
+        return [kind == 'expr' for kind in self.kinds]
+
+    def unique_sql(self, alias_all: bool, force: Tuple[int, ...] = (),
+                   extra_edits: Tuple[Tuple[int, int, str], ...] = ()) -> Optional[str]:
+        """The statement with a unique alias (``"_hcN"``, N = result
+        position) on every column whose name collides with another's, and
+        with ``alias_all`` also on every expression without an alias (and
+        on the columns in ``force``). A ``*`` with colliding columns is
+        spelled out. ``extra_edits`` are further (start, end, text)
+        replacements outside the select list. None when nothing needs
+        renaming."""
+        counts: Dict[str, int] = {}
+        for key in self.keys:
+            if key is not None:
+                counts[key.lower()] = counts.get(key.lower(), 0) + 1
+
+        def needs(col: int) -> bool:
+            if col in force:
+                return True
+            key = self.keys[col]
+            if key is None:
+                return alias_all or self.kinds[col] == 'expr'
+            return counts.get(key.lower(), 0) > 1
+
+        by_item: Dict[int, List[int]] = {}
+        for col, item in enumerate(self.items):
+            by_item.setdefault(item, []).append(col)
+        edits = []
+        for index, item in enumerate(self.shape.items):
+            cols = by_item.get(index, [])
+            if not any(needs(c) for c in cols):
+                continue
+            if item.kind == 'star':
+                parts = []
+                for c in cols:
+                    ref = (f'{_sql_ident(self.qualifiers[c])}.{_sql_ident(self.sources[c][1])}'
+                           if self.qualifiers[c] is not None and self.sources[c] is not None
+                           else None)
+                    if ref is None:
+                        return None
+                    parts.append(f'{ref} AS "{self.UNIQUE_PREFIX}{c}"' if needs(c) else ref)
+                edits.append((item.start, item.end, ', '.join(parts)))
+            else:
+                c = cols[0]
+                expr = self.sql[item.expr_start:item.expr_end]
+                edits.append((item.start, item.end, f'{expr} AS "{self.UNIQUE_PREFIX}{c}"'))
+        edits.extend(extra_edits)
+        if not edits:
+            return None
+        out = self.sql
+        for start, end, text in sorted(edits, reverse=True):
+            out = out[:start] + text + out[end:]
+        return out
+
+    def join_order_fix(self) -> Optional[Tuple[str, int]]:
+        """HeliosDB Nano (4.31 binding, 4.41 server) ignores ``ORDER BY
+        t.col`` and ``ORDER BY <n>`` when the query joins tables; ordering by
+        a select-list alias works. Alias the select-list columns those terms
+        name, add the ones not selected as trailing columns, and order by
+        the aliases. Returns (statement, number of trailing columns to drop
+        from the result), or None when not applicable."""
+        shape = self.shape
+        if len(shape.tables) < 2 or shape.compound:
+            return None
+        terms = _sql.parse_order_by(self.sql)
+        if not terms or not any(t.kind in ('column', 'position') and
+                                (t.kind == 'position' or t.qualifier is not None)
+                                for t in terms):
+            return None
+        force = []
+        edits = []
+        hidden = []
+        for term in terms:
+            col = None
+            if term.kind == 'column' and term.qualifier is None:
+                continue        # unqualified names sort correctly
+            if term.kind == 'position':
+                if 1 <= (term.position or 0) <= self.width:
+                    col = term.position - 1
+            elif term.kind == 'column' and term.qualifier is not None:
+                for c in range(self.width):
+                    source = self.sources[c]
+                    item = shape.items[self.items[c]]
+                    if source is None or source[1] != term.column:
+                        continue
+                    alias = item.qualifier if item.kind == 'column' else self.qualifiers[c]
+                    table = [t for t in shape.tables if t.alias == term.qualifier]
+                    if alias == term.qualifier or (alias is None and table
+                                                   and table[0].name == source[0]):
+                        col = c
+                        break
+            else:
+                continue
+            if col is None:
+                if term.kind != 'column' or shape.distinct:
+                    return None
+                # not selected: sort by a trailing column dropped afterwards
+                name = f'_ho{len(hidden)}'
+                hidden.append(f'{self.sql[term.start:term.end]} AS "{name}"')
+                edits.append((term.start, term.end, f'"{name}"'))
+                continue
+            force.append(col)
+            edits.append((term.start, term.end, f'"{self.UNIQUE_PREFIX}{col}"'))
+        if not edits:
+            return None
+        if hidden:
+            edits.append((shape.list_end, shape.list_end, ', ' + ', '.join(hidden)))
+        out = self.unique_sql(alias_all=False, force=tuple(force), extra_edits=tuple(edits))
+        return (out, len(hidden)) if out is not None else None
+
 
 class Connection:
     """
@@ -1172,6 +1403,13 @@ class Connection:
         self._rowid_hw: Dict[str, int] = {}
         self._insert_parse_cache: Dict[str, Optional[_sql.InsertInfo]] = {}
         self._total_changes = 0
+        # sqlite3_last_insert_rowid(): 0 until a row is inserted; None after
+        # an insert into a table without an INTEGER PRIMARY KEY.
+        self._last_insert_rowid: Optional[int] = 0
+        # SELECT shapes by statement text, and table layouts for them.
+        self._shape_cache: Dict[str, Optional[_sql.SelectShape]] = {}
+        self._layout_cache: Dict[str, Optional[List[Tuple[str, str, str]]]] = {}
+        self._catalog_labels: Optional[bool] = None
         # Daemon mode: wrap each statement inside a transaction in a
         # savepoint so a failing statement leaves the transaction usable,
         # as in SQLite. statement_savepoints=False saves the round trips.
@@ -1363,11 +1601,12 @@ class Connection:
         elif self._mode == 'daemon':
             return self._execute_daemon(sql)
 
-    def _execute_bound(self, sql: str, values: List[Any]) -> Union[Dict, int]:
+    def _execute_bound(self, sql: str, values: List[Any],
+                       plan: Optional['_ResultPlan'] = None) -> Union[Dict, int]:
         """Execute one statement with ``$n`` parameters on the in-process
         binding, mapping engine errors to sqlite3's exception classes."""
         try:
-            return self._backend.run(sql, values)
+            return self._backend.run(sql, values, plan)
         except _embedded._LockTimeout:
             raise OperationalError("database is locked") from None
         except Error:
@@ -1377,6 +1616,27 @@ class Connection:
         except Exception as e:
             message = str(e).strip()
             raise _DRIVER_ERRORS[_embedded.classify_error(message)](message) from None
+
+    def _rerun_unique(self, plan: _ResultPlan, values: Optional[List[Any]],
+                      first: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a SELECT whose result lost columns to a name collision again,
+        with a unique name on each column (see _ResultPlan.unique_sql)."""
+        alt = plan.unique_sql(alias_all=True)
+        if alt is not None:
+            if self._sqlite_types:
+                alt = _sql.rewrite_sqlite_aggregates(alt)
+            try:
+                result = self._execute_bound(alt, values or [], plan)
+            except Error:
+                result = None
+            if isinstance(result, dict) and len(result.get('columns') or ()) == plan.width:
+                return result
+        warnings.warn(
+            "heliosdb_sqlite: result columns with the same name were merged by the "
+            "embedded engine binding; give each column a distinct alias "
+            f"(expected {plan.width} columns, got {len(first.get('columns') or ())})",
+            RuntimeWarning, stacklevel=4)
+        return first
 
     def _execute_bound_many(self, sql: str, batch: List[List[Any]]) -> int:
         try:
@@ -1431,6 +1691,7 @@ class Connection:
         self._decltype_cache.clear()
         self._insert_parse_cache.clear()
         self._lastrowid_pk_cache.clear()
+        self._layout_cache.clear()
 
     def _table_exists(self, table: str) -> bool:
         rows = self._internal_rows(
@@ -1553,9 +1814,43 @@ class Connection:
                 return _RowidPlan(table, column, sequence, None, True)
         return None
 
+    def _rowid_sync_for(self, stmt: str) -> None:
+        """Embedded mode: before an INSERT into an INTEGER PRIMARY KEY
+        table, make sure the binding's sequence state is this database's
+        (see _embedded._SEQUENCE_OWNERS)."""
+        backend = self._backend
+        if backend is None or not self._schema_bookkeeping:
+            return
+        info = self._insert_parse_cache.get(stmt)
+        if info is None:
+            info = _sql.parse_insert(stmt)
+        if info is None:
+            return
+        rowid = self._rowid_info(info.table)
+        if rowid is None:
+            return
+        column, sequence, _ = rowid
+        if backend.claim_sequence(sequence):
+            self._rowid_resync(info.table, column, sequence)
+
+    def _rowid_resync(self, table: str, column: str, sequence: str) -> None:
+        """Set the rowid sequence so its next value is max(key) + 1."""
+        try:
+            self._internal_rows(
+                f'SELECT setval({_sql_literal(sequence)}, '
+                f'COALESCE(max({_sql_ident(column)}), 0) + 1, false) FROM {_sql_ident(table)}')
+            self._rowid_hw.pop(table, None)
+        except Error as e:
+            warnings.warn(
+                f"heliosdb_sqlite: could not resynchronise the INTEGER PRIMARY KEY sequence of "
+                f"{table!r}: {e}", RuntimeWarning)
+
     def _rowid_after(self, plan: _RowidPlan) -> None:
         """Move the rowid sequence past the largest explicit key, so the
         next INSERT that omits the key gets max + 1 as in SQLite."""
+        if self._backend is not None and self._backend.claim_sequence(plan.sequence):
+            self._rowid_resync(plan.table, plan.column, plan.sequence)
+            return
         try:
             top = plan.max_known
             if plan.unknown:
@@ -1635,9 +1930,14 @@ class Connection:
                         f'UPDATE {self.DECLTYPE_CATALOG} SET table_name = {_sql_literal(args[0])} '
                         f'WHERE table_name = {_sql_literal(table)}')
                 elif action == 'rename_column':
+                    label = args[2] if len(args) > 2 and args[2] != args[1] else None
+                    set_label = ''
+                    if self._catalog_has_labels(add=True):
+                        set_label = (', column_label = '
+                                     + ('NULL' if label is None else _sql_literal(label)))
                     self._internal_rows(
-                        f'UPDATE {self.DECLTYPE_CATALOG} SET column_name = {_sql_literal(args[1])} '
-                        f'WHERE table_name = {_sql_literal(table)} '
+                        f'UPDATE {self.DECLTYPE_CATALOG} SET column_name = {_sql_literal(args[1])}'
+                        f'{set_label} WHERE table_name = {_sql_literal(table)} '
                         f'AND column_name = {_sql_literal(args[0])}')
                 elif action == 'drop_column':
                     self._internal_rows(
@@ -1656,41 +1956,204 @@ class Connection:
         if not self._catalog_exists and create:
             self._internal_rows(
                 f'CREATE TABLE IF NOT EXISTS {self.DECLTYPE_CATALOG} ('
-                'table_name TEXT NOT NULL, column_name TEXT NOT NULL, decltype TEXT NOT NULL)')
+                'table_name TEXT NOT NULL, column_name TEXT NOT NULL, decltype TEXT NOT NULL, '
+                'column_label TEXT)')
             self._catalog_exists = True
+            self._catalog_labels = True
         return bool(self._catalog_exists)
 
-    def _catalog_write(self, table: str, columns: List[Tuple[str, str]],
+    def _catalog_write(self, table: str, columns: List[Tuple[str, ...]],
                        replace: bool = True) -> None:
-        columns = [(name, decl) for name, decl in columns if decl]
-        if not columns:
+        """Record ``(engine name, declared type[, name as written])`` for
+        columns of ``table``. Columns without a declared type are recorded
+        too when their name was written in mixed case (for
+        cursor.description)."""
+        entries = []
+        for column in columns:
+            name, decl = column[0], column[1]
+            written = column[2] if len(column) > 2 else None
+            label = written if written and written != name else None
+            if decl or label:
+                entries.append((name, decl or '', label))
+        if not entries:
             return
         self._catalog_ready(create=True)
-        names = ', '.join(_sql_literal(name) for name, _ in columns)
+        labels = self._catalog_has_labels(add=True)
+        names = ', '.join(_sql_literal(name) for name, _, _ in entries)
         where = f'table_name = {_sql_literal(table)}'
         self._internal_rows(f'DELETE FROM {self.DECLTYPE_CATALOG} WHERE {where}'
                             + ('' if replace else f' AND column_name IN ({names})'))
-        rows = ', '.join(f'({_sql_literal(table)}, {_sql_literal(name)}, {_sql_literal(decl)})'
-                         for name, decl in columns)
-        self._internal_rows(f'INSERT INTO {self.DECLTYPE_CATALOG} '
-                            f'(table_name, column_name, decltype) VALUES {rows}')
+        if labels:
+            rows = ', '.join(
+                f'({_sql_literal(table)}, {_sql_literal(name)}, {_sql_literal(decl)}, '
+                f'{"NULL" if label is None else _sql_literal(label)})'
+                for name, decl, label in entries)
+            self._internal_rows(f'INSERT INTO {self.DECLTYPE_CATALOG} '
+                                f'(table_name, column_name, decltype, column_label) VALUES {rows}')
+        else:
+            rows = ', '.join(f'({_sql_literal(table)}, {_sql_literal(name)}, {_sql_literal(decl)})'
+                             for name, decl, _ in entries)
+            self._internal_rows(f'INSERT INTO {self.DECLTYPE_CATALOG} '
+                                f'(table_name, column_name, decltype) VALUES {rows}')
 
-    def _declared_types_of(self, table: str) -> Dict[str, str]:
+    def _catalog_rows(self, table: str) -> Dict[str, Tuple[str, Optional[str]]]:
+        """``{column: (declared type, name as declared)}`` recorded for
+        ``table`` in the declared-type catalog."""
         cached = self._decltype_cache.get(table)
         if cached is not None:
             return cached
-        types: Dict[str, str] = {}
+        rows: Dict[str, Tuple[str, Optional[str]]] = {}
         try:
             if self._catalog_ready():
+                labels = self._catalog_has_labels()
                 for row in self._internal_rows(
-                        f'SELECT column_name, decltype FROM {self.DECLTYPE_CATALOG} '
+                        'SELECT column_name, decltype'
+                        + (', column_label' if labels else '')
+                        + f' FROM {self.DECLTYPE_CATALOG} '
                         f'WHERE table_name = {_sql_literal(table)}'):
-                    if len(row) == 2 and row[0] is not None and row[1] is not None:
-                        types[str(row[0])] = str(row[1])
+                    if len(row) >= 2 and row[0] is not None and row[1] is not None:
+                        label = row[2] if len(row) > 2 and row[2] is not None else None
+                        rows[str(row[0])] = (str(row[1]), None if label is None else str(label))
         except Error:
-            types = {}
-        self._decltype_cache[table] = types
-        return types
+            rows = {}
+        self._decltype_cache[table] = rows
+        return rows
+
+    def _declared_types_of(self, table: str) -> Dict[str, str]:
+        return {name: decl for name, (decl, _) in self._catalog_rows(table).items()}
+
+    def _declared_labels_of(self, table: str) -> Dict[str, str]:
+        if not self._declared_types:
+            return {}
+        return {name: label for name, (_, label) in self._catalog_rows(table).items() if label}
+
+    def _catalog_has_labels(self, add: bool = False) -> bool:
+        """The catalog has the column_label column. A catalog written by an
+        older version gets it with ``add`` (when this layer records a
+        CREATE / ALTER TABLE; never from a query)."""
+        if self._catalog_labels:
+            return True
+        try:
+            rows = self._internal_rows(
+                'SELECT column_name FROM information_schema.columns '
+                f'WHERE table_name = {_sql_literal(self.DECLTYPE_CATALOG)}')
+            present = 'column_label' in {str(r[0]) for r in rows if r}
+            if not present and add:
+                self._internal_rows(f'ALTER TABLE {self.DECLTYPE_CATALOG} ADD COLUMN column_label TEXT')
+                present = True
+        except Error:
+            present = False
+        self._catalog_labels = present
+        return present
+
+    def _table_layout(self, table: str) -> Optional[List[Tuple[str, str, str]]]:
+        """``[(engine column name, name as declared, udt_name), ...]`` of
+        ``table`` in column order; None when the table is unknown."""
+        if table in self._layout_cache:
+            return self._layout_cache[table]
+        layout: Optional[List[Tuple[str, str, str]]] = None
+        try:
+            rows = self._internal_rows(
+                'SELECT column_name, ordinal_position, udt_name FROM information_schema.columns '
+                f'WHERE table_name = {_sql_literal(table)}')
+            rows = [r for r in rows if len(r) >= 3 and r[0] is not None]
+            if rows:
+                rows.sort(key=lambda r: int(r[1] or 0))
+                labels = self._declared_labels_of(table)
+                layout = [(str(r[0]), labels.get(str(r[0])) or str(r[0]), str(r[2] or '').lower())
+                          for r in rows]
+        except (Error, TypeError, ValueError):
+            layout = None
+        if len(self._layout_cache) > 256:
+            self._layout_cache.clear()
+        self._layout_cache[table] = layout
+        return layout
+
+    def _result_plan(self, stmt: str) -> Optional[_ResultPlan]:
+        """How sqlite3 would name and type the result columns of ``stmt``
+        (a SELECT), or None when the statement is beyond this description
+        (the engine's names are used then)."""
+        if not self._sqlite_types or (self._backend is None and self._mode != 'daemon'):
+            return None
+        if stmt in self._shape_cache:
+            shape = self._shape_cache[stmt]
+        else:
+            try:
+                shape = _sql.parse_select(stmt)
+            except Exception:
+                shape = None
+            if len(self._shape_cache) > 128:
+                self._shape_cache.clear()
+            self._shape_cache[stmt] = shape
+        if shape is None:
+            return None
+        tables = shape.tables
+        layouts = {}
+        for t in tables:
+            if t.name is not None and t.name not in layouts:
+                layouts[t.name] = self._table_layout(t.name)
+        plan = _ResultPlan(stmt, shape)
+        for index, item in enumerate(shape.items):
+            if item.kind == 'star':
+                chosen = [t for t in tables if item.qualifier is None or t.alias == item.qualifier]
+                if not chosen or (item.qualifier is None and not shape.star_safe):
+                    return None
+                for t in chosen:
+                    layout = layouts.get(t.name) if t.name is not None else None
+                    if layout is None:
+                        return None
+                    for name, label, udt in layout:
+                        plan.add(label, (t.name, name), 'column', index, name, t.alias, udt)
+                continue
+            if item.kind == 'column':
+                source = None
+                label = item.written
+                if item.qualifier is not None:
+                    matches = [t for t in tables if t.alias == item.qualifier]
+                    if not matches:
+                        matches = [t for t in tables if t.name == item.qualifier]
+                else:
+                    matches = [t for t in tables if t.name is not None and layouts.get(t.name)
+                               and any(c[0] == item.column for c in layouts[t.name])]
+                udt = None
+                if len(matches) == 1 and matches[0].name is not None:
+                    layout = layouts.get(matches[0].name) or []
+                    for name, declared, udt_name in layout:
+                        if name == item.column:
+                            source = (matches[0].name, name)
+                            label = declared
+                            udt = udt_name
+                            break
+                key = item.alias if item.alias is not None else item.column
+                plan.add(item.alias if item.alias is not None else label, source,
+                         'column', index, key, None, udt)
+                continue
+            text = stmt[item.expr_start:item.expr_end]
+            plan.add(item.alias if item.alias is not None else text, None, 'expr', index,
+                     item.alias)
+        if shape.compound:
+            # Names come from the first SELECT; declared types do not apply.
+            plan.sources = [None] * plan.width
+            plan.udts = [None] * plan.width
+        plan.finish()
+        return plan
+
+    def _plan_decltypes(self, plan: _ResultPlan) -> List[Optional[str]]:
+        """sqlite3_column_decltype() of each result column: the source
+        column's declared type ('' for an expression, which gets no
+        converter); None for a column of a table created without this
+        layer (its type OID is used instead)."""
+        out: List[Optional[str]] = []
+        for source, kind in zip(plan.sources, plan.kinds):
+            if source is None:
+                out.append('')
+                continue
+            declared = self._declared_types_of(source[0]) if self._declared_types else {}
+            if declared:
+                out.append(declared.get(source[1], ''))
+            else:
+                out.append(None)
+        return out
 
     def _result_decltypes(self, sql: str, columns: List[Any]) -> List[Optional[str]]:
         """Declared type of each result column that names a column of a
